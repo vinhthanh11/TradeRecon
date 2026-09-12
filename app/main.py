@@ -12,6 +12,8 @@ app = Flask(__name__, template_folder='../reports/templates', static_folder='../
 KAFKA_BOOTSTRAP_SERVERS = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
 DB_URL = 'sqlite:///./reports/reconciliation.db'
 
+## Performance Metrics
+
 TOTAL_TRADES_PROCESSED = Counter('traderecon_total_trades_processed', 'Total number of trades processed')
 MATCHED_TRADES_COUNT = Counter('traderecon_matched_trades_total', 'Total number of trades that matched')
 MISMATCHED_TRADES_COUNT = Counter('traderecon_mismatched_trades_total', 'Total number of trades that mismatched')

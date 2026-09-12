@@ -155,9 +155,9 @@ if __name__ == "__main__":
     producer = create_kafka_producer_with_retries()
 
     # Option 1: Generate dynamic trade data with mismatches (COMMENTED OUT)
-    # print("\n--- Generating and sending dynamic trade data ---")
-    # simulated_trades = generate_trade_data(num_trades=30)
-    # send_trade_data(producer, simulated_trades)
+    print("\n--- Generating and sending dynamic trade data ---")
+    simulated_trades = generate_trade_data(num_trades=30)
+    send_trade_data(producer, simulated_trades)
 
     # Option 2: Send data from static CSV files (UNCOMMENTED)
     print("\n--- Sending static CSV data (executions) ---")
