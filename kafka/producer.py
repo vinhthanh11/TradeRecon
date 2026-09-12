@@ -2,12 +2,12 @@ import json
 import time
 import pandas as pd
 from kafka import KafkaProducer
-from kafka.errors import NoBrokersAvailable
 from datetime import datetime, timedelta
 import random
 import os
 
 # Kafka configuration
+# Producer is run on Windows Compose, so the broker is localhost:9092. The consumer is run in Docker Compose, so the broker is kafka:9092.
 KAFKA_BOOTSTRAP_SERVERS = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
 EXECUTION_TOPIC = 'executions'
 CONFIRMATION_TOPIC = 'confirmations'
@@ -26,9 +26,6 @@ def create_kafka_producer_with_retries(retries=10, delay=5):
             )
             print("Successfully connected to Kafka.")
             return producer
-        except NoBrokersAvailable:
-            print(f"No Kafka brokers available. Retrying in {delay} seconds...")
-            time.sleep(delay)
         except Exception as e:
             print(f"An unexpected error occurred during Kafka connection: {e}. Retrying...")
             time.sleep(delay)
@@ -132,19 +129,26 @@ def send_trade_data(producer, trades_data):
 def send_csv_data(producer, file_path, topic):
     try:
         df = pd.read_csv(file_path)
+        
         print(f"Sending data from {file_path} to topic {topic}...")
         for index, row in df.iterrows():
             message = row.to_dict()
-            producer.send(topic, message)
+            future = producer.send(topic, message)
+            
+            metadata = future.get(timeout=10)
+            
+            print("Sent row...")
             # Add print statement to confirm data is being sent for each row
             print(f"    Sent row {index+1} for trade_id {row.get('trade_id', 'N/A')} to {topic}")
-            time.sleep(0.01) # Small delay to avoid overwhelming Kafka
+            time.sleep(0.02) # Small delay to avoid overwhelming Kafka
         producer.flush()
+        
         print(f"Finished sending data from {file_path} to topic {topic}.")
     except FileNotFoundError:
         print(f"Error: CSV file not found at {file_path}")
     except Exception as e:
         print(f"An error occurred while sending CSV data: {e}")
+        raise
 
 
 if __name__ == "__main__":

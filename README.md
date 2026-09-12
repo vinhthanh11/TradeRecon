@@ -203,7 +203,7 @@ git clone https://github.com/vinhthanh11/TradeRecon
 cd TradeRecon
 ```
 
-### 3. Build and Start
+### 3. Build and Start (The Infra, not Data yet)
 
 ```bash
 docker-compose up --build -d
@@ -211,7 +211,7 @@ docker-compose up --build -d
 
 Wait ~1–2 minutes for services to fully boot.
 
-### 4. Simulate Trade Data
+### 4. Simulate Trade Data (This is the data part!)
 
 ```bash
 docker exec -it traderecon_app python kafka/producer.py

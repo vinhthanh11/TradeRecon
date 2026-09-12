@@ -61,7 +61,7 @@ class TradeDataConsumer(threading.Thread):
             except Exception as e:
                 print(f"Error in consumer for topic {self.topic}: {e}")
             
-        if consumer is not None:    
+        if consumer is None:    
             return
         try:
             for message in consumer:
