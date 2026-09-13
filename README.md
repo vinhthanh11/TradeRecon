@@ -1,149 +1,136 @@
-# 🔄 TradeRecon: Real-Time Trade Reconciliation Engine
+# TradeRecon Architecture Upgrade (Berlin Release)
 
-[![Project Status: Stable](https://img.shields.io/badge/status-stable-green.svg)](https://github.com/vinhthanh11/TradeRecon)
+## Overview
 
-A streaming post-trade reconciliation system inspired by real-world infrastructure.
-> **System & Monitoring Metrics**
-> - ⚡ **Per-record Latency:** ~45ms  
----
+TradeRecon is evolving from a simple row-by-row reconciliation demo into a more extensible trade reconciliation framework that can handle different trade representations, broker-specific formats, international instruments, partial fills, aggregation, and more complex matching logic.
 
-## 🧠 Problem Statement
+The original version of TradeRecon worked well when execution, broker confirmation, and P&L records shared a simple and consistent schema. As the data model expanded to include fields such as ISIN, exchange, currency, settlement date, fees, and different ticker representations, the reconciliation logic needed to become more modular.
 
-In trading systems, multiple systems (internal and external) log the same trade at different times, with slight variations. These include:
+This upgrade introduces a normalization and canonical trade representation layer so that source systems can remain different while TradeRecon compares them in a consistent internal format.
 
-- Internal trading engines  
-- Broker confirmations  
-- Risk/PnL systems  
-- Clearinghouses or custodians  
+## Goal of the Upgrade
 
-Discrepancies in price, quantity, or timestamp can indicate serious issues: execution errors, data corruption, or compliance violations.
+The main goal is to separate three concerns that were previously mixed together inside `reconcile.py`:
 
-**Goals**
+1. **Source-specific representation**
 
-- Reconciling trade records across systems  
-- Detecting and flagging mismatches  
-- Generating end-of-day compliance reports  
-- Ensuring timely alerts and robust downstream reliability
+   * Different systems may use different field names or instrument identifiers.
+   * Example: `7203` internally and `7203.T` at the broker.
 
----
+2. **Trade identity and matching**
 
-## 🎯 Project Goal
+   * Two records may represent the same economic trade even if their IDs or row structure are different.
+   * Example: two internal fills may correspond to one aggregated broker confirmation.
 
-To build a real-time, Kafka-driven trade reconciliation engine that compares:
+3. **Reconciliation**
 
-- Execution data from the internal engine  
-- Confirmation data from broker systems  
-- Optional risk snapshots from the PnL system  
+   * Once records are normalized and matched, TradeRecon can compare quantity, price, timestamp, settlement date, currency, P&L, and other fields.
 
-…and flags any mismatches in real-time.
+The intended architecture is:
 
----
-
-## 💡 Use Case and Need
-
-In a fast-paced trading environment, maintaining data integrity across numerous disparate systems is paramount. Even minor variations in trade details can lead to significant financial, operational, or regulatory risks.
-
-**TradeRecon** directly addresses this by providing an automated, real-time mechanism to:
-
-- **Ensure Data Consistency**: Guaranteeing that all internal and external records of a trade align.  
-- **Mitigate Risk**: Rapidly identifying potential execution errors, data corruption, or unauthorized activities.  
-- **Streamline Compliance**: Automating audit-ready reconciliation reports for regulatory obligations.  
-- **Enhance Operational Efficiency**: Reducing manual reconciliation effort and allowing focus on higher-value engineering tasks.
-
----
-
-## 🔁 Data Flow Architecture
-
-```mermaid
-graph TD
-    A[Execution Engine] --> B(Kafka Topic: executions)
-    C[Confirmation System] --> D(Kafka Topic: confirmations)
-    E[PnL System] --> F(Kafka Topic: pnl_snapshot)
-
-    B -- Trade Data --> G[TradeRecon Engine]
-    D -- Trade Data --> G
-    F -- PnL Data --> G
-
-    G -- Reconciled Data --> H[Mismatch Checker]
-    H -- Results --> I[SQLite Database]
-    H -- Metrics --> P[Prometheus Metrics Endpoint]
-    H -- Alerts --> J[CLI Logs / Simulated Alerts]
-    H -- Reports --> K[HTML Report / CSV Export]
-
-    P -- Scrapes Metrics --> Q(Prometheus)
-    Q -- Data Source --> R(Grafana)
-    R -- Visualizes --> S[Monitoring Dashboards]
+```text
+Raw Source Data
+      ↓
+Normalization
+      ↓
+Instrument Mapping
+      ↓
+Canonical Trade Representation
+      ↓
+Trade Matching / Aggregation
+      ↓
+Reconciliation
+      ↓
+Database / Reports / Monitoring
 ```
 
----
+The key principle is:
 
-## 🗂️ Data Sources
-
-Simulated as Kafka topics (and/or fallback CSVs) for flexible testing:
-
-- `executions`: Primary trade record from the internal trading system.  
-- `broker_confirmations`: External confirmation of a trade from brokers.  
-- `pnl_snapshot`: Snapshot of PnL impact and commission from the accounting system.
-
-Example entries:
-
-```csv
-# executions.csv
-trade_id,ticker,quantity,price,timestamp
-T001,AAPL,100,190.50,2025-07-26T10:01:23
-
-# broker_confirmations.csv
-trade_id,ticker,quantity,price,timestamp
-T001,AAPL,100,190.50,2025-07-26T10:01:22.900
-
-# pnl_snapshot.csv
-trade_id,pnl_impact,commission
-T001,95.00,0.5
+```text
+Raw data can be different.
+Canonical data should not be.
 ```
 
----
+## Why This Upgrade Is Needed
 
-## 📏 Reconciliation Logic
+The original architecture assumed that records from different systems had nearly identical structures.
 
-For every matched trade ID across the incoming streams, **TradeRecon** applies the following checks:
+For example:
 
-- ✅ **Quantity Match**: Exact match between execution and confirmation.  
-- ✅ **Price Match**: Must be within a tolerance (e.g., ≤ 0.005).  
-- ✅ **Timestamp Match**: Must be within a 100ms drift tolerance.  
-- ✅ **PnL Consistency**:  
-  ```
-  abs(price × quantity - commission - pnl_impact) < 1.0
-  ```
+```text
+Execution
+trade_id
+ticker
+quantity
+price
+timestamp
 
-**On mismatch:**
-
-- Detailed CLI logging  
-- HTML summary report update  
-- Persistence to SQLite (audit trail)  
-- Prometheus metric updates
-
----
-
-## 🧰 Tech Stack
-
-| Layer              | Tools                        | Role in Project |
-|-------------------|------------------------------|-----------------|
-| Stream Transport   | Kafka (`kafka-python`)        | Real-time ingestion |
-| Data Persistence   | SQLite + SQLAlchemy           | Audit trail storage |
-| Reconciliation Engine | Custom Python + threading   | Core logic for trade comparison |
-| Reporting & UI     | Flask + Jinja2                | Dynamic reports and UI |
-| Metrics Collection | Prometheus + `prometheus_client` | Export metrics |
-| Visualization      | Grafana                       | Monitoring dashboards |
-| Alerting           | CLI Logs / (Slack, Email - simulated) | Immediate visibility |
-| Containerization   | Docker, docker-compose        | Easy deployment |
-| Testing            | Pytest                        | Unit + integration tests |
-| Monitoring         | Python `logging`              | Runtime observability |
-
----
-
-## 🧱 Folder Structure
-
+Confirmation
+trade_id
+ticker
+quantity
+price
+timestamp
 ```
+
+This allowed direct comparisons such as:
+
+```python
+execution["price"]
+confirmation["price"]
+```
+
+That approach becomes fragile when different systems represent the same trade differently.
+
+For example:
+
+```text
+Internal execution
+ticker = 7203
+ISIN   = JP3633400001
+
+Broker confirmation
+ticker = 7203.T
+ISIN   = JP3633400001
+```
+
+A simple ticker comparison would incorrectly identify this as a mismatch.
+
+The upgraded architecture instead identifies the underlying instrument first and then performs reconciliation using a normalized representation.
+
+## Current Architecture
+
+The current TradeRecon flow is approximately:
+
+```text
+CSV
+ ↓
+Kafka Producer
+ ↓
+Kafka Consumer
+ ↓
+reconcile.py
+ ↓
+SQLite
+ ↓
+Reports / Grafana / Prometheus
+```
+
+Most reconciliation logic currently lives inside `reconcile.py`.
+
+This works well for basic one-to-one trade reconciliation, but adding more special cases directly into the same file would eventually make the reconciliation engine difficult to maintain.
+
+## Proposed Architecture
+
+The upgraded structure introduces three new layers:
+
+* `normalization/`
+* `reference/`
+* `matching/`
+
+The proposed project structure is:
+
+```text
 TradeRecon/
 ├── app/
 │   ├── __init__.py
@@ -151,20 +138,49 @@ TradeRecon/
 │   ├── reconcile.py
 │   ├── report_generator.py
 │   ├── utils.py
-│   └── main.py
+│   ├── main.py
+│   │
+│   ├── normalization/
+│   │   ├── __init__.py
+│   │   ├── execution_normalizer.py
+│   │   ├── confirmation_normalizer.py
+│   │   ├── pnl_normalizer.py
+│   │   └── canonical_trade.py
+│   │
+│   ├── reference/
+│   │   ├── __init__.py
+│   │   ├── instrument_mapper.py
+│   │   └── instrument_reference.py
+│   │
+│   └── matching/
+│       ├── __init__.py
+│       ├── trade_matcher.py
+│       └── aggregation.py
+│
 ├── kafka/
 │   └── producer.py
+│
 ├── data/
 │   ├── executions.csv
 │   ├── broker_confirmations.csv
-│   └── pnl_snapshot.csv
+│   ├── pnl_snapshot.csv
+│   │
+│   └── reference/
+│       └── instruments.csv
+│
 ├── reports/
 │   └── templates/
 │       └── report.html
+│
 ├── tests/
-│   └── test_reconciliation.py
+│   ├── test_reconciliation.py
+│   ├── test_normalization.py
+│   ├── test_instrument_mapping.py
+│   └── test_trade_matching.py
+│
 ├── prometheus/
 │   └── prometheus.yml
+│
 ├── grafana/
 │   ├── provisioning/
 │   │   ├── datasources/
@@ -173,120 +189,466 @@ TradeRecon/
 │   │       └── dashboard.yml
 │   └── dashboards/
 │       └── traderecon_dashboard.json
+│
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
 └── README.md
 ```
 
----
+## New Components
 
-## 🚀 Steps to Run
+### `normalization/`
 
-> **Prerequisites:**  
-> Ensure you have Docker + Docker Compose installed.
+The normalization layer converts raw source messages into a consistent internal representation.
 
-### 1. Setup Files
+Each source can keep its own format, while the rest of the application receives standardized fields.
 
-- Replace your `docker-compose.yml` with the provided one.
-- Create the `prometheus/` directory and add `prometheus.yml`.
-- Add `grafana/provisioning/` structure with:
-  - `datasources/datasource.yml`
-  - `dashboards/dashboard.yml`
-- Add `grafana/dashboards/traderecon_dashboard.json`
-- Ensure updated `app/main.py` and `app/reconcile.py`
+Example:
 
-### 2. Clone and Navigate
-
-```bash
-git clone https://github.com/vinhthanh11/TradeRecon
-cd TradeRecon
+```text
+Broker ticker: 7203.T
+Internal ticker: 7203
+Canonical instrument: JP3633400001
 ```
 
-### 3. Build and Start (The Infra, not Data yet)
+#### `execution_normalizer.py`
 
-```bash
-docker-compose up --build -d
+Normalizes execution records coming from the internal OMS or execution feed.
+
+Responsibilities may include:
+
+```text
+field-name normalization
+timestamp normalization
+currency normalization
+instrument lookup
+missing-field handling
+source metadata
 ```
 
-Wait ~1–2 minutes for services to fully boot.
+#### `confirmation_normalizer.py`
 
-### 4. Simulate Trade Data (This is the data part!)
+Normalizes broker confirmation records.
 
-```bash
-docker exec -it traderecon_app python kafka/producer.py
+This is where broker-specific field names and representations should be handled rather than placing those rules directly inside `reconcile.py`.
+
+#### `pnl_normalizer.py`
+
+Normalizes P&L records and creates consistent fields for:
+
+```text
+realized P&L
+unrealized P&L
+FX P&L
+fees
+net P&L
+valuation timestamp
 ```
 
-Watch logs from `docker-compose` to see processing in real time.
+#### `canonical_trade.py`
 
-### 5. Access Reconciliation Report
+Defines TradeRecon's internal representation of a trade.
 
-Visit [http://localhost:5000/](http://localhost:5000/)  
-- View dynamic reconciliation results  
-- Optionally download CSV summary
+A simplified canonical object may contain:
 
-### 6. Access Grafana Dashboard
-
-Visit [http://localhost:3000/](http://localhost:3000/)
-
-- **Login:**  
-  - Username: `admin`  
-  - Password: `admin`  
-- View the pre-provisioned **TradeRecon Overview** dashboard.
-
-## 📊 Observability and Reporting
-
-**🔍 Monitoring Metrics with Grafana**  
-Latency, bandwidth, and per-record reconciliation delays are logged and exported via Prometheus. Queue lengths and throughput metrics are visualized using **Grafana dashboards** for real-time observability and debugging.
-
-![Grafana Metrics Dashboard](./readme-screenshots/grafana.png)
-
-
-
-
-**🧾 Trade Overview Reporting with Jinja2**
-
-Reconciliation summaries are dynamically rendered using **Jinja2-powered HTML templates**. These reports include matched and mismatched trades, timestamp skews, and PnL validation outcomes.
-
-![Jinja Dashboard 1](./readme-screenshots/jinja1.png)
-
-![Jinja Dashboard 2](./readme-screenshots/jinja2.png)
-
-
-## ⚙️ Current Assumptions & Scaling Targets
-
-#### 📌 Assumptions
-- The reconciliation engine currently runs **per incoming trade event** via **Kafka**.
-- Input trade data is **simulated using CSV files**, acting as Kafka producers.
-- Reconciliation happens **in real-time**, not batch-based.
-
-#### 🧭 Planned Architectural Extension
-To improve observability and align with **end-of-day compliance workflows**, the pipeline run can be **automated to start using Apache Airflow** as an **alternative batch processor**, replacing Kafka for time-triggered execution.
-
-We propose a **hybrid horizontal architecture**:
-- Support **both Kafka (real-time)** and **Airflow (batch)** backends.
-- Introduce a boolean field `reconciled` to the data schema, ensuring **duplicate trades or already-matched entries are skipped** in the batch pipeline.
-
-#### 🚧 Scaling Bottleneck & Migration Target
-- Current ingestion relies on **flat CSV files**, which limits scalability and concurrency.
-- As a key future goal, migrate the ingestion and persistence layer to **MongoDB** or another scalable store.
-- This also supports transitioning from **Kafka-based real-time streaming** to **Airflow-based batch reconciliation** as needed, enabling more flexible and resilient pipelines.
-```mermaid
-graph TD
-    A[Reconcile Trades] --> B[Generate Report]
-    B --> C[Send Email]
+```python
+trade_id
+instrument_id
+ticker
+side
+quantity
+price
+currency
+timestamp
+settlement_date
+source
 ```
 
-## 🧪 Future Extensions
+The canonical representation becomes the common language between normalization, matching, and reconciliation.
 
-| Category       | Extension Idea              | Description                                                             |
-|----------------|-----------------------------|-------------------------------------------------------------------------|
-| 🧪 **Testing**     | Hypothesis-based Fuzzing     | Generate boundary cases for corrupted/malformed trades.                 |
-| ⏱ **Scheduling**  | Airflow DAG Integration      | Schedule end-of-day reports and batch validations.                      |
-| 🔐 **Security**    | OAuth2 / AuthZ Middleware    | Role-based access control to reports and APIs.                          |
-| 📦 **Database**    | Switch to PostgreSQL         | For better scale and query performance with audit trails.               |
-| 📬 **Alerting**    | Slack/Email Integrations     | Integrate with actual messaging services for ops alerts.                |
-| 🧠 **ML Integration** | Anomaly Detection         | Use ML to score suspicious trade patterns before reconciliation.        |
+## Instrument Reference Layer
 
+### `reference/instrument_mapper.py`
 
----
+The instrument mapper resolves different identifiers to the same security.
+
+Example:
+
+```text
+7203
+7203.T
+JP3633400001
+
+→ Toyota Motor Corporation
+→ Canonical ID: JP3633400001
+```
+
+This allows TradeRecon to distinguish between a representation difference and a true instrument mismatch.
+
+### `data/reference/instruments.csv`
+
+A reference table can store mappings such as:
+
+```csv
+canonical_ticker,isin,cusip,sedol,broker_ticker,exchange,mic,currency
+AAPL,US0378331005,037833100,2046251,AAPL,NASDAQ,XNAS,USD
+7203,JP3633400001,,,7203.T,Tokyo Stock Exchange,XTKS,JPY
+HSBA,GB0005405286,,,HSBA.L,London Stock Exchange,XLON,GBP
+SAP,DE0007164600,,,SAP.DE,Xetra,XETR,EUR
+```
+
+The reference layer can later be expanded to support additional identifier types and broker-specific mappings.
+
+## Matching Layer
+
+### `matching/trade_matcher.py`
+
+The trade matcher determines whether records from different systems represent the same economic trade.
+
+The current project mainly matches records using:
+
+```text
+trade_id
+```
+
+The upgraded version can eventually use multiple attributes:
+
+```text
+instrument
+side
+quantity
+price
+timestamp
+account
+currency
+settlement date
+```
+
+This allows TradeRecon to handle cases where internal and broker trade IDs differ.
+
+A future matching score could look like:
+
+```text
+Instrument match          +40
+Quantity match            +20
+Side match                +10
+Price within tolerance    +15
+Timestamp within tolerance +15
+--------------------------------
+Total                     100
+```
+
+### `matching/aggregation.py`
+
+Aggregation handles cases where one system represents a trade differently from another.
+
+Example:
+
+```text
+Internal executions
+
+BUY 100 @ 190.10
+BUY 100 @ 190.30
+```
+
+Broker confirmation:
+
+```text
+BUY 200 @ 190.20
+```
+
+The aggregation layer can calculate:
+
+```text
+Total quantity = 200
+VWAP           = 190.20
+```
+
+and compare the aggregated internal execution against the broker confirmation.
+
+This creates the foundation for:
+
+```text
+one-to-one matching
+one-to-many matching
+many-to-one matching
+partial fills
+aggregated confirmations
+```
+
+## Reconciliation Engine
+
+`reconcile.py` remains the core reconciliation engine, but its responsibility becomes narrower.
+
+Instead of understanding every source format and every broker-specific edge case, it should primarily compare normalized records.
+
+Examples of reconciliation checks include:
+
+```text
+quantity
+price
+timestamp drift
+instrument identity
+trade currency
+settlement date
+fees
+net P&L
+```
+
+The intended long-term flow is:
+
+```python
+execution = normalize_execution(raw_execution)
+confirmation = normalize_confirmation(raw_confirmation)
+
+match = match_trades(
+    execution,
+    confirmation
+)
+
+result = reconcile(
+    execution,
+    confirmation,
+    pnl
+)
+```
+
+This keeps `reconcile.py` focused on reconciliation instead of becoming a collection of source-specific exceptions.
+
+## Trade Representation Examples
+
+The upgraded architecture is intended to support cases such as:
+
+### Different ticker representations
+
+```text
+Internal:
+7203
+
+Broker:
+7203.T
+
+Canonical:
+JP3633400001
+```
+
+### Different trade IDs
+
+```text
+Internal trade ID:
+T12345
+
+Broker trade ID:
+BRK99881
+```
+
+TradeRecon can still identify them as the same trade using instrument, side, quantity, price, account, and timestamp.
+
+### Partial fills
+
+```text
+Internal:
+100 shares
+100 shares
+
+Broker:
+200 shares
+```
+
+The aggregation layer combines the internal fills before reconciliation.
+
+### International securities
+
+TradeRecon can reconcile trades across markets with fields such as:
+
+```text
+ISIN
+MIC
+currency
+FX rate
+settlement date
+stamp duty
+broker fees
+exchange fees
+```
+
+## What Stays the Same
+
+This upgrade does not replace the existing project.
+
+The following remain core components:
+
+```text
+Kafka ingestion
+Docker environment
+SQLite reconciliation database
+Prometheus metrics
+Grafana dashboards
+report generation
+existing CSV input feeds
+current reconciliation logic
+```
+
+The new architecture adds layers around the existing reconciliation engine so that future complexity can be introduced without continuously expanding a single file.
+
+## Development Plan
+
+The upgrade can be implemented incrementally.
+
+### Phase 1 — Normalization and Instrument Mapping
+
+Add:
+
+```text
+app/normalization/
+app/reference/
+data/reference/instruments.csv
+```
+
+Initial goal:
+
+```text
+Raw Execution
+Raw Confirmation
+      ↓
+Normalized representation
+      ↓
+Current reconciliation engine
+```
+
+This phase should support:
+
+```text
+different ticker formats
+ISIN-based instrument matching
+timestamp normalization
+currency normalization
+missing fields
+broker-specific field names
+```
+
+### Phase 2 — Trade Matching and Aggregation
+
+Add:
+
+```text
+app/matching/trade_matcher.py
+app/matching/aggregation.py
+```
+
+Support:
+
+```text
+different trade IDs
+partial fills
+one-to-many matches
+many-to-one matches
+VWAP aggregation
+match scoring
+```
+
+### Phase 3 — Product-Specific and Advanced Rules
+
+Future modules may include:
+
+```text
+special_cases/
+├── equities.py
+├── options.py
+├── fixed_income.py
+├── fx.py
+└── swaps.py
+```
+
+Potential future capabilities include:
+
+```text
+option contract normalization
+bond identifiers
+FX pair normalization
+corporate action adjustments
+broker-specific reconciliation rules
+trade lifecycle events
+real-time break alerts
+portfolio-level reconciliation
+```
+
+## Testing Strategy
+
+Each new layer should be tested independently.
+
+### Normalization tests
+
+Verify that different source representations produce the same canonical trade.
+
+Example:
+
+```text
+7203
+7203.T
+JP3633400001
+
+→ same instrument
+```
+
+### Matching tests
+
+Test:
+
+```text
+one-to-one
+one-to-many
+many-to-one
+different trade IDs
+partial fills
+timestamp tolerances
+```
+
+### Reconciliation tests
+
+Continue validating:
+
+```text
+quantity
+price
+currency
+settlement date
+P&L
+fees
+timestamp drift
+```
+
+## Long-Term Direction
+
+The goal of TradeRecon is not simply to compare two CSV rows.
+
+The longer-term objective is to model how a real post-trade reconciliation system handles multiple representations of the same economic event.
+
+The architecture is therefore moving from:
+
+```text
+Compare Row A with Row B
+```
+
+toward:
+
+```text
+Ingest
+   ↓
+Understand
+   ↓
+Normalize
+   ↓
+Identify
+   ↓
+Match
+   ↓
+Reconcile
+   ↓
+Classify breaks
+   ↓
+Report and monitor
+```
+
+This provides a stronger foundation for increasingly complex trade workflows while keeping each component understandable, testable, and independently extensible.
