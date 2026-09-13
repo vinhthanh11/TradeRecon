@@ -37,6 +37,26 @@ reconciliation_engine.set_metrics_collectors(
     reconciliation_latency_histogram=RECONCILIATION_LATENCY_SECONDS
 )
 
+### STALE-RECORD SWEEPER
+MATCH_TIMEOUT_SECONDS = int( os.getenv("MATCH_TIMEOUT_SECONDS", "30") )
+
+STALE_SWEEP_INTERVAL_SECONDS = int( os.getenv("STALE_SWEEP_INTERVAL_SECONDS", "5") )
+
+def run_stale_record_sweeper( reconciliation_engine, stop_event ):
+    """
+    Periodically checks MatchStore for records that have
+    remained unmatched beyond the configured timeout.
+    """
+
+    while not stop_event.is_set():
+        try:
+            reconciliation_engine.process_stale_records( timeout_seconds=MATCH_TIMEOUT_SECONDS )
+        except Exception as exc:
+            print( f"Stale-record sweep failed: {exc}" )
+        stop_event.wait( STALE_SWEEP_INTERVAL_SECONDS )
+
+
+
 consumer_threads = []
 
 @app.route('/')
@@ -67,7 +87,7 @@ def start_consumers():
     execution_consumer = TradeDataConsumer(
         topic="executions",
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-        group_id=f"traderecon_exec_group_{int(time.time())}",
+        group_id="traderecon_exec_group",
         reconcile_engine=reconciliation_engine,
         instrument_mapper=instrument_mapper
     )
@@ -75,7 +95,7 @@ def start_consumers():
     confirmation_consumer = TradeDataConsumer(
         topic="confirmations",
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-        group_id=f"traderecon_conf_group_{int(time.time())}",
+        group_id="traderecon_exec_group",
         reconcile_engine=reconciliation_engine,
         instrument_mapper=instrument_mapper
     )
@@ -83,7 +103,7 @@ def start_consumers():
     pnl_consumer = TradeDataConsumer(
         topic="pnl_snapshot",
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-        group_id=f"traderecon_pnl_group_{int(time.time())}",
+        group_id="traderecon_exec_group",
         reconcile_engine=reconciliation_engine,
         instrument_mapper=instrument_mapper
     )
@@ -109,17 +129,40 @@ def stop_consumers():
 
 if __name__ == '__main__':
     start_http_server(8000, addr='0.0.0.0')
-
     print("Prometheus metrics server started on port 8000.")
 
-    consumer_thread = threading.Thread(target=start_consumers)
+    # Start Kafka consumers.
+    consumer_thread = threading.Thread( target=start_consumers )
     consumer_thread.start()
 
+    # Used to cleanly stop the stale-record sweeper.
+    stale_sweeper_stop_event = threading.Event()
+
+    # Start stale-record sweeper.
+    stale_sweeper_thread = threading.Thread(
+        target=run_stale_record_sweeper, 
+        args=( reconciliation_engine, stale_sweeper_stop_event ),
+        daemon=True, 
+        name="stale-record-sweeper" )
+
+    stale_sweeper_thread.start()
+
+    print( f"Stale-record sweeper started: " f"timeout={MATCH_TIMEOUT_SECONDS}s, " f"interval={STALE_SWEEP_INTERVAL_SECONDS}s" )
+    
     try:
-        app.run(debug=False, host='0.0.0.0', port=5000)
+        app.run( debug=False, host='0.0.0.0', port=5000 )
+
     except KeyboardInterrupt:
         print("Flask app shutting down.")
+
     finally:
+        # Stop stale-record sweeper.
+        stale_sweeper_stop_event.set()
+
+        stale_sweeper_thread.join( timeout=2 )
+        # Stop Kafka consumers.
         stop_consumers()
+
         consumer_thread.join()
-        print("Application gracefully shut down.")
+
+        print( "Application gracefully shut down." )

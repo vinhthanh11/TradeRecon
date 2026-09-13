@@ -25,6 +25,7 @@ class ReconciliationResult(Base):
     trade_id = Column(String, unique=True, nullable=False)
     ticker = Column(String)
     status = Column(String, nullable=False)
+    break_type = Column(String)
     execution_data = Column(SQLiteJSON)
     confirmation_data = Column(SQLiteJSON)
     pnl_data = Column(SQLiteJSON)
@@ -44,6 +45,13 @@ class ReconciliationEngine:
     def __init__(self, db_url="sqlite:///./reports/reconciliation.db", db_session=None):
         # New economic matching store.
         self.match_store = MatchStore()
+        
+        # Completed economic matches.
+        self.completed_matches = {}
+        
+        # Source trade ID -> canonical reconciliation ID.
+        self.reconciliation_aliases = {}
+        
 
         self.engine = create_engine(db_url)
         Base.metadata.create_all(self.engine)
@@ -170,16 +178,12 @@ class ReconciliationEngine:
         elif topic == "pnl_snapshot":
             self.match_store.add_pnl(message)
             print( f"Stored pending P&L {trade_id}. Pending P&L records: {self.match_store.pnl_count()}" )
+            
+            self._try_attach_pnl(message)
         else:
             print( f"Unknown topic: {topic} for trade_id {trade_id}" )
             
-    def _perform_reconciliation_and_save(
-        self,
-        trade_id: str,
-        execution,
-        confirmation,
-        pnl=None
-    ):
+    def _perform_reconciliation_and_save( self, trade_id: str, execution, confirmation, pnl=None ):
         """
         Compare canonical economic fields.
 
@@ -415,6 +419,7 @@ class ReconciliationEngine:
                     is_matched = False
 
         status = "MATCHED" if is_matched else "MISMATCHED"
+        break_type = self._classify_break(mismatches)
 
         print(f"Reconciliation for Trade {trade_id}: Status = {status}")
 
@@ -435,10 +440,11 @@ class ReconciliationEngine:
             confirmation,
             pnl,
             status,
+            break_type,
             mismatches
         )
 
-    def _save_result( self, trade_id, execution, confirmation, pnl, status, mismatches ):
+    def _save_result( self, trade_id, execution, confirmation, pnl, status, break_type, mismatches ):
         """
         Store raw source records in SQLite while reconciliation operates
         on normalized canonical objects.
@@ -449,7 +455,9 @@ class ReconciliationEngine:
         confirmation_data = self._serialize(confirmation)
         pnl_data = self._serialize(pnl)
 
-        ticker = self._get(execution, "ticker", "N/A")
+        ticker = ( self._get( execution, "ticker" ) 
+                or self._get( confirmation, "ticker" ) 
+                or "N/A" )
 
         try:
             existing = (
@@ -464,6 +472,7 @@ class ReconciliationEngine:
                 existing.execution_data = execution_data
                 existing.confirmation_data = confirmation_data
                 existing.pnl_data = pnl_data
+                existing.break_type = break_type
                 existing.mismatch_details = mismatches
                 existing.reconciliation_timestamp = datetime.utcnow()
 
@@ -477,6 +486,7 @@ class ReconciliationEngine:
                     execution_data=execution_data,
                     confirmation_data=confirmation_data,
                     pnl_data=pnl_data,
+                    break_type=break_type,
                     mismatch_details=mismatches
                 )
 
@@ -555,13 +565,23 @@ class ReconciliationEngine:
             execution_for_reconciliation
         )
 
-        # Reuse the reconciliation logic you already built.
-        reconciliation_id = (
-            self._get(confirmation, "trade_id")
-            or self._get(
-                execution_for_reconciliation,
-                "trade_id"
-            )
+        # When a match is found, save the matched pair before calling reconciliation
+        reconciliation_id = self._build_reconciliation_id(execution_for_reconciliation)
+        
+        if not reconciliation_id:
+            print( "Unable to create reconciliation ID " "for matched trade." )
+            return
+
+        self._register_completed_match( reconciliation_id, execution_for_reconciliation, confirmation )
+
+        self._perform_reconciliation_and_save( reconciliation_id, execution_for_reconciliation, confirmation, pnl )
+        
+        
+        # Keep the matched pair available in case P&L arrives later.
+        self._register_completed_match(
+            reconciliation_id,
+            execution_for_reconciliation,
+            confirmation
         )
 
         self._perform_reconciliation_and_save(
@@ -570,7 +590,7 @@ class ReconciliationEngine:
             confirmation,
             pnl
         )
-        
+                
 
     def _try_match_pending_confirmations(self):
         """
@@ -614,3 +634,293 @@ class ReconciliationEngine:
                 return pnl
 
         return None
+    
+    def _try_attach_pnl(self, pnl):
+        """
+        Attach late-arriving P&L using any known source trade ID.
+
+        The P&L trade ID is first resolved through the alias map
+        to TradeRecon's canonical reconciliation ID.
+        """
+        pnl_trade_id = self._get( pnl, "trade_id" )
+
+        if not pnl_trade_id:
+            print( "P&L record has no trade_id; " "cannot associate it yet." )
+            return
+
+        pnl_trade_id = str( pnl_trade_id )
+
+        # Convert source-system ID into TradeRecon's
+        # canonical reconciliation ID.
+        reconciliation_id = ( self.reconciliation_aliases.get( pnl_trade_id ) )
+
+        if not reconciliation_id:
+            print( f"No reconciliation alias found for P&L {pnl_trade_id}" )
+            return
+
+        match = self.completed_matches.get( reconciliation_id )
+
+        if not match:
+            print( f"No completed match found for reconciliation {reconciliation_id}" )
+            return
+
+        execution = match["execution"]
+        confirmation = match["confirmation"]
+
+        self.match_store.remove_pnl( pnl )
+
+        self._perform_reconciliation_and_save(
+            reconciliation_id,
+            execution,
+            confirmation,
+            pnl
+        )
+
+        print( f"Late P&L {pnl_trade_id} attached to reconciliation {reconciliation_id}" )
+        
+        
+    def _register_completed_match(self, reconciliation_id, execution, confirmation):
+        """
+        Store an already matched execution/confirmation pair so
+        late-arriving P&L can be associated later.
+        """
+        reconciliation_id = str(reconciliation_id)
+
+
+        self.completed_matches[reconciliation_id] = {
+            "execution": execution,
+            "confirmation": confirmation
+        }
+        
+        # Canonical ID points to itself.
+        self.reconciliation_aliases[reconciliation_id] = reconciliation_id
+        
+        # Register all internal execution IDs.
+        for execution_id in self._get_component_trade_ids(execution):
+            self.reconciliation_aliases[execution_id] = reconciliation_id
+
+        # Register broker confirmation ID.
+        confirmation_id = self._get( confirmation, "trade_id" )
+
+        if confirmation_id:
+            self.reconciliation_aliases[str(confirmation_id)] = reconciliation_id
+        
+        
+    def _get_component_trade_ids(self, execution):
+        """
+        Return all internal execution IDs represented by a canonical trade.
+
+        For a normal one-to-one trade this returns one ID.
+        For an aggregated trade it returns all component execution IDs.
+        """
+
+        raw_data = self._get(
+            execution,
+            "raw_data",
+            {}
+        ) or {}
+
+        component_ids = raw_data.get(
+            "component_trade_ids"
+        )
+
+        if component_ids:
+            return [
+                str(trade_id)
+                for trade_id in component_ids
+                if trade_id
+            ]
+
+        trade_id = self._get(
+            execution,
+            "trade_id"
+        )
+
+        return [str(trade_id)] if trade_id else []
+
+    def _build_reconciliation_id(self, execution):
+        """
+        Build TradeRecon's canonical ID for the economic trade.
+
+        One execution:
+            T001
+
+        Aggregated executions:
+            T001+T002
+        """
+
+        component_ids = self._get_component_trade_ids(
+            execution
+        )
+
+        if component_ids:
+            return "+".join(component_ids)
+
+        trade_id = self._get(
+            execution,
+            "trade_id"
+        )
+
+        return (
+            str(trade_id)
+            if trade_id
+            else None
+        )
+
+
+    def process_stale_records( self, timeout_seconds=30 ):
+        """
+        Convert records that have remained unmatched beyond the
+        configured timeout into explicit reconciliation breaks.
+        """
+
+        stale_executions = (
+            self.match_store.get_stale_executions(
+                timeout_seconds
+            )
+        )
+
+        stale_confirmations = (
+            self.match_store.get_stale_confirmations(
+                timeout_seconds
+            )
+        )
+
+        for execution in stale_executions:
+            trade_id = self._get(
+                execution,
+                "trade_id"
+            )
+
+            print(
+                f"Execution {trade_id} exceeded "
+                f"{timeout_seconds}s matching timeout."
+            )
+
+            self._save_unmatched_break(
+                execution=execution,
+                confirmation=None,
+                break_type="MISSING_CONFIRMATION"
+            )
+
+            self.match_store.remove_execution(
+                execution
+            )
+
+        for confirmation in stale_confirmations:
+            trade_id = self._get(
+                confirmation,
+                "trade_id"
+            )
+
+            print(
+                f"Confirmation {trade_id} exceeded "
+                f"{timeout_seconds}s matching timeout."
+            )
+
+            self._save_unmatched_break(
+                execution=None,
+                confirmation=confirmation,
+                break_type="MISSING_EXECUTION"
+            )
+
+            self.match_store.remove_confirmation(
+                confirmation
+            )
+            
+            
+    def _save_unmatched_break( self, execution=None, confirmation=None, break_type="UNMATCHED" ):
+        """
+        Persist an unmatched record as an explicit trade break.
+        """
+
+        record = execution or confirmation
+
+        if record is None:
+            return
+
+        trade_id = self._get(
+            record,
+            "trade_id"
+        )
+
+        if not trade_id:
+            print(
+                f"Cannot persist {break_type}: "
+                f"record has no trade_id."
+            )
+            return
+
+        trade_id = str(trade_id)
+
+        mismatches = [{
+            "field": "matching",
+            "reason": break_type
+        }]
+
+        if self.total_trades_counter:
+            self.total_trades_counter.inc()
+
+        if self.mismatched_trades_counter:
+            self.mismatched_trades_counter.inc()
+
+        self._save_result(
+            trade_id=trade_id,
+            execution=execution,
+            confirmation=confirmation,
+            pnl=None,
+            status="MISMATCHED",
+            mismatches=mismatches
+        )
+
+        print(
+            f"Trade {trade_id} aged out: "
+            f"{break_type}"
+        )
+        
+    def _classify_break(self, mismatches):
+        """
+        Convert detailed mismatch records into one high-level break type.
+        """
+
+        if not mismatches:
+            return None
+
+        break_types = set()
+
+        field_mapping = {
+            "instrument_id": "INSTRUMENT_BREAK",
+            "quantity": "QUANTITY_BREAK",
+            "price": "PRICE_BREAK",
+            "side": "SIDE_BREAK",
+            "timestamp": "TIMESTAMP_BREAK",
+            "currency": "CURRENCY_BREAK",
+            "settlement_date": "SETTLEMENT_BREAK",
+            "net_pnl": "PNL_BREAK",
+            "pnl_calculation_error": "PNL_BREAK"
+        }
+
+        for mismatch in mismatches:
+            reason = mismatch.get("reason")
+
+            if reason in {
+                "MISSING_EXECUTION",
+                "MISSING_CONFIRMATION"
+            }:
+                break_types.add(reason)
+                continue
+
+            field = mismatch.get("field")
+
+            break_type = field_mapping.get(field)
+
+            if break_type:
+                break_types.add(break_type)
+
+        if not break_types:
+            return "OTHER_BREAK"
+
+        if len(break_types) > 1:
+            return "MULTIPLE_BREAKS"
+
+        return next(iter(break_types))
