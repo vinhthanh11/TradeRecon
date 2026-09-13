@@ -6,8 +6,10 @@ from kafka import KafkaConsumer
 from kafka.errors import NoBrokersAvailable
 
 from .reconcile import ReconciliationEngine
+from .normalization.normalizer import normalize_message
+from .reference.instrument_mapper import InstrumentMapper
 
-# FIX (Amsterdam release)
+# Berlin release:
 # Previously, the consumer attempted to connect to Kafka only once.
 # If the Kafka broker was still starting, KafkaConsumer raised
 # NoBrokersAvailable and the consumer thread terminated permanently.
@@ -24,6 +26,7 @@ class TradeDataConsumer(threading.Thread):
         self.bootstrap_servers = bootstrap_servers
         self.group_id = group_id
         self.reconcile_engine = reconcile_engine
+        self.instrument_mapper = instrument_mapper
         self.running = True
 
         print(f"Initializing consumer for topic: {self.topic}, group_id: {self.group_id}, broker: {self.bootstrap_servers}")
@@ -64,8 +67,35 @@ class TradeDataConsumer(threading.Thread):
             for message in consumer:
                 if not self.running:
                     break
+                
+                raw_message = message.value
+                
                 print(f"Received message from topic '{self.topic}': {message.value}")
-                self.reconcile_engine.process_message(self.topic, message.value)
+                
+                ## This is deserializes the Kafka message and passes the raw message.value straight into the reconciliation engine. The reconciliation engine is responsible for handling the message and performing any necessary processing or reconciliation logic.
+                # -------------------------------------------------
+                # Normalize the raw source message.
+                #
+                # Execution, broker confirmation, and P&L records
+                # can all have different representations.
+                # The normalizer converts them into TradeRecon's
+                # canonical internal format.
+                # -------------------------------------------------
+                try:
+                    normalized_message = normalize_message(self.topic, raw_message, self.instrument_mapper )
+
+                except Exception as e:
+                    print(f"Normalization error for topic '{self.topic}': {e}" )
+
+                    # Do not kill the consumer because one message
+                    # contains invalid or unsupported data.
+                    continue
+
+                print(f"Normalized message from '{self.topic}': {normalized_message}" )
+
+                # Send the normalized object to reconciliation.
+                self.reconcile_engine.process_message( self.topic, normalized_message )
+
         
         except Exception as e:
             print(f"Error while consuming messages from topic {self.topic}: {e}")
