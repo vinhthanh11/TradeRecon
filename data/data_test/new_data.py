@@ -177,51 +177,25 @@ def generate_trade_data(
         broker_trade_id = f"BT{i:06d}"
         broker_execution_id = f"BE{i:06d}"
 
-        account_id = random.choice([
-            "ACC001",
-            "ACC002",
-            "ACC003"
-        ])
+        account_id = random.choice([ "ACC001", "ACC002", "ACC003" ])
+        portfolio_id = random.choice([ "PORT_US", "PORT_GLOBAL", "PORT_ARB" ])
+        side = random.choice([ "BUY", "SELL" ])
 
-        portfolio_id = random.choice([
-            "PORT_US",
-            "PORT_GLOBAL",
-            "PORT_ARB"
-        ])
-
-        side = random.choice([
-            "BUY",
-            "SELL"
-        ])
-
-        quantity = random.choice([
-            50,
-            100,
-            200,
-            500,
-            1000
-        ])
-
+        quantity = random.choice([ 50, 100, 200, 500, 1000 ])
+        
         # Slight random movement around reference price
-        price = round(
-            instrument["base_price"]
-            * (1 + random.uniform(-0.01, 0.01)),
-            4
-        )
+        price = round( instrument["base_price"] * (1 + random.uniform(-0.01, 0.01)), 4 )
 
         currency = instrument["currency"]
         fx_rate = fx_rates[currency]
 
-        notional = round(
-            quantity * price,
-            2
-        )
+        notional = round( quantity * price, 2 )
 
         # Internal execution time
-        execution_timestamp = (base_time+ timedelta(seconds=random.randint(0, 3600), milliseconds=random.randint(0, 999)))
+        execution_timestamp = (base_time+ timedelta(seconds=random.randint(0, 3600), milliseconds=random.randint(0, 150)))
 
         # Broker time can differ slightly
-        broker_timestamp = (execution_timestamp + timedelta(milliseconds=random.randint(-300, 300)))
+        broker_timestamp = (execution_timestamp + timedelta(milliseconds=random.randint(-150, 150)))
 
         trade_date = execution_timestamp.date()
 
@@ -232,124 +206,53 @@ def generate_trade_data(
         # FEES
         # -------------------------
 
-        commission = round(
-            max(0.50, quantity * 0.002),
-            2
-        )
-
-        exchange_fee = round(
-            quantity * 0.0005,
-            2
-        )
-
-        clearing_fee = round(
-            quantity * 0.0002,
-            2
-        )
-
+        commission = round( max(0.50, quantity * 0.002), 2 )
+        exchange_fee = round( quantity * 0.0005, 2 )
+        clearing_fee = round( quantity * 0.0002, 2 )
+        
         tax = 0.0
         stamp_duty = 0.0
 
         # Example UK buy-side stamp duty
-        if (
-            instrument["country"] == "GB"
-            and side == "BUY"
-        ):
-            stamp_duty = round(
-                notional * 0.005,
-                2
-            )
+        if ( instrument["country"] == "GB" and side == "BUY" ):
+            stamp_duty = round( notional * 0.005, 2 )
 
-        total_fees = round(
-            commission
-            + exchange_fee
-            + clearing_fee
-            + tax
-            + stamp_duty,
-            2
-        )
+        total_fees = round( commission + exchange_fee + clearing_fee + tax + stamp_duty, 2 )
 
         if side == "BUY":
-            net_settlement_amount = round(
-                notional + total_fees,
-                2
-            )
+            net_settlement_amount = round( notional + total_fees, 2 )
 
         else:
-            net_settlement_amount = round(
-                notional - total_fees,
-                2
-            )
+            net_settlement_amount = round( notional - total_fees, 2 )
 
         # -------------------------
         # P&L
         # -------------------------
 
-        mark_price = round(
-            price
-            * (1 + random.uniform(-0.02, 0.02)),
-            4
-        )
+        mark_price = round( price * (1 + random.uniform(-0.02, 0.02)), 4 )
+        market_value = round( quantity * mark_price, 2 )
+        direction = ( 1 if side == "BUY" else -1 )
 
-        market_value = round(
-            quantity * mark_price,
-            2
-        )
-
-        direction = (
-            1 if side == "BUY"
-            else -1
-        )
-
-        unrealized_pnl_local = round(
-            (
-                mark_price - price
-            )
-            * quantity
-            * direction,
-            2
-        )
+        unrealized_pnl_local = round( ( mark_price - price ) * quantity * direction, 2 )
 
         # Convert P&L to USD
-        unrealized_pnl = round(
-            unrealized_pnl_local * fx_rate,
-            2
-        )
+        unrealized_pnl = round( unrealized_pnl_local * fx_rate, 2 )
 
         realized_pnl = 0.0
 
         # Small FX movement for non-USD trades
         if currency != "USD":
-            fx_pnl = round(
-                random.uniform(-10, 10),
-                2
-            )
+            fx_pnl = round( random.uniform(-10, 10), 2 )
         else:
             fx_pnl = 0.0
 
-        fees_usd = round(
-            total_fees * fx_rate,
-            2
-        )
-
-        net_pnl = round(
-            realized_pnl
-            + unrealized_pnl
-            + fx_pnl
-            - fees_usd,
-            2
-        )
+        fees_usd = round( total_fees * fx_rate, 2 )
+        
+        net_pnl = round( realized_pnl + unrealized_pnl + fx_pnl - fees_usd, 2 )
 
         # P&L timestamp represents snapshot time,
         # NOT execution time.
-        pnl_timestamp = datetime.combine(
-            trade_date,
-            datetime.min.time()
-        ).replace(
-            hour=16,
-            minute=0,
-            second=0
-        )
+        pnl_timestamp = datetime.combine(trade_date, datetime.min.time()).replace( hour=16, minute=0, second=0 )
 
         # =====================================================
         # EXECUTION RECORD
@@ -401,17 +304,7 @@ def generate_trade_data(
             "quantity": quantity,
 
             # Small broker-side price difference.
-            "price": round(
-                price
-                + random.choice([
-                    0,
-                    0,
-                    0,
-                    0.0001,
-                    -0.0001
-                ]),
-                4
-            ),
+            "price": round( price + random.choice([ 0, 0, 0, 0.0001, -0.0001 ]), 4 ),
 
             "gross_notional": notional,
             "trade_currency": currency,
@@ -419,15 +312,9 @@ def generate_trade_data(
             "venue_mic": instrument["venue_mic"],
             "market_country": instrument["country"],
 
-            "broker_name": random.choice([
-                "Broker_A",
-                "Broker_B",
-                "Broker_C"
-            ]),
+            "broker_name": random.choice([ "Broker_A", "Broker_B", "Broker_C" ]),
 
-            "timestamp": broker_timestamp.isoformat(
-                timespec="milliseconds"
-            ),
+            "timestamp": broker_timestamp.isoformat( timespec="milliseconds" ),
 
             "settlement_date": settlement_date.isoformat(),
             "fx_rate": fx_rate,

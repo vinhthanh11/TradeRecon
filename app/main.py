@@ -6,11 +6,17 @@ from .consumer import TradeDataConsumer
 from .reconcile import ReconciliationEngine
 from .report_generator import ReportGenerator
 from prometheus_client import start_http_server, Counter, Gauge, Histogram
+from app.reference.instrument_mapper import InstrumentMapper
+
 
 app = Flask(__name__, template_folder='../reports/templates', static_folder='../reports')
 
 KAFKA_BOOTSTRAP_SERVERS = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
 DB_URL = 'sqlite:///./reports/reconciliation.db'
+
+## Instrument Mapper Initialization
+instrument_mapper = InstrumentMapper("data/instruments.csv")
+
 
 ## Performance Metrics
 
@@ -55,24 +61,33 @@ def download_csv():
 
 def start_consumers():
     print("Starting Kafka consumers...")
+    
+    # All consumers share the same reconciliation engine
+    # and the same instrument reference mapper.
     execution_consumer = TradeDataConsumer(
-        topic='executions',
+        topic="executions",
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-        group_id=f'traderecon_exec_group_{int(time.time())}',
-        reconcile_engine=reconciliation_engine
+        group_id=f"traderecon_exec_group_{int(time.time())}",
+        reconcile_engine=reconciliation_engine,
+        instrument_mapper=instrument_mapper
     )
+
     confirmation_consumer = TradeDataConsumer(
-        topic='confirmations',
+        topic="confirmations",
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-        group_id=f'traderecon_conf_group_{int(time.time())}',
-        reconcile_engine=reconciliation_engine
+        group_id=f"traderecon_conf_group_{int(time.time())}",
+        reconcile_engine=reconciliation_engine,
+        instrument_mapper=instrument_mapper
     )
+
     pnl_consumer = TradeDataConsumer(
-        topic='pnl_snapshot',
+        topic="pnl_snapshot",
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-        group_id=f'traderecon_pnl_group_{int(time.time())}',
-        reconcile_engine=reconciliation_engine
+        group_id=f"traderecon_pnl_group_{int(time.time())}",
+        reconcile_engine=reconciliation_engine,
+        instrument_mapper=instrument_mapper
     )
+
 
     consumer_threads.append(execution_consumer)
     consumer_threads.append(confirmation_consumer)

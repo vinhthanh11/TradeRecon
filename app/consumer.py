@@ -20,7 +20,8 @@ from .reference.instrument_mapper import InstrumentMapper
 
 
 class TradeDataConsumer(threading.Thread):
-    def __init__(self, topic: str, bootstrap_servers: str, group_id: str, reconcile_engine: ReconciliationEngine):
+    def __init__(self, topic: str, bootstrap_servers: str, group_id: str, 
+                 reconcile_engine: ReconciliationEngine, instrument_mapper: InstrumentMapper):
         super().__init__()
         self.topic = topic
         self.bootstrap_servers = bootstrap_servers

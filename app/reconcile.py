@@ -1,11 +1,15 @@
 import threading
 import time
+from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from sqlalchemy import create_engine, Column, String, DateTime, Integer
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.dialects.sqlite import JSON as SQLiteJSON
-from .utils import parse_timestamp, is_within_tolerance, is_timestamp_within_drift
+from .utils import is_within_tolerance, is_timestamp_within_drift
+from .matching.match_store import MatchStore
+from .matching.group_matcher import find_match
+
 
 Base = declarative_base()
 
@@ -33,20 +37,17 @@ class ReconciliationResult(Base):
 
 class ReconciliationEngine:
     """
-    Receives execution, broker confirmation, and P&L messages,
-    groups them by trade_id, reconciles the records, and saves results.
+    Receives normalized execution, confirmation, and P&L objects,
+    groups them by trade_id, reconciles them, and persists the result.
     """
 
     def __init__(self, db_url="sqlite:///./reports/reconciliation.db", db_session=None):
-        # Temporary in-memory storage for messages waiting on their matching records.
-        self.trade_store = {}
-        self.trade_store_lock = threading.Lock()
+        # New economic matching store.
+        self.match_store = MatchStore()
 
-        # Create the reconciliation database and table if they do not exist.
         self.engine = create_engine(db_url)
         Base.metadata.create_all(self.engine)
 
-        # Tests can inject their own DB session. Production creates one here.
         if db_session:
             self.session = db_session
         else:
@@ -56,7 +57,6 @@ class ReconciliationEngine:
         self.db_session = self.session
         print(f"ReconciliationEngine initialized with DB: {db_url}")
 
-        # Prometheus metric collectors are injected later by the application.
         self.total_trades_counter = None
         self.matched_trades_counter = None
         self.mismatched_trades_counter = None
@@ -71,88 +71,120 @@ class ReconciliationEngine:
         in_memory_store_size_gauge,
         reconciliation_latency_histogram
     ):
-        """Attach Prometheus metric collectors to the reconciliation engine."""
+        """Attach Prometheus metric collectors."""
         self.total_trades_counter = total_trades_counter
         self.matched_trades_counter = matched_trades_counter
         self.mismatched_trades_counter = mismatched_trades_counter
         self.in_memory_store_size_gauge = in_memory_store_size_gauge
         self.reconciliation_latency_histogram = reconciliation_latency_histogram
 
-    def process_message(self, topic: str, message: dict):
+    def _get(self, obj, field, default=None):
         """
-        Store each Kafka message under its trade_id.
-        Reconciliation is attempted whenever a new source record arrives.
+        Transitional helper.
+
+        Supports both:
+        - Canonical dataclass objects: execution.price
+        - Legacy dictionaries: execution["price"]
+
+        This lets old tests continue working during migration.
         """
-        trade_id = message.get("trade_id")
+        if obj is None:
+            return default
+
+        if isinstance(obj, dict):
+            return obj.get(field, default)
+
+        return getattr(obj, field, default)
+
+    def _serialize(self, obj):
+        """
+        Convert canonical objects into JSON-safe dictionaries
+        before storing them in SQLite.
+        """
+        if obj is None:
+            return None
+
+        # Prefer original raw source data for auditability.
+        raw_data = self._get(obj, "raw_data")
+
+        if raw_data:
+            return raw_data
+
+        if isinstance(obj, dict):
+            return obj
+
+        if is_dataclass(obj):
+            data = asdict(obj)
+
+            # datetime cannot be written directly to JSON.
+            for key, value in data.items():
+                if isinstance(value, datetime):
+                    data[key] = value.isoformat()
+
+            return data
+
+        return {"value": str(obj)}
+
+    def process_message(self, topic: str, message):
+        """
+        Store normalized records by trade_id.
+
+        Messages should normally be CanonicalTrade or CanonicalPnl
+        objects after passing through the normalization layer.
+        """
+        trade_id = self._get( message, "trade_id" )
 
         if not trade_id:
-            print(f"Warning: Message from topic {topic} missing trade_id: {message}")
+            print( f"Warning: Message from topic {topic} missing trade_id: {message}" )
             return
 
         trade_id = str(trade_id)
+        # ---------------------------------------------------------
+        # Execution arrives
+        # Store it until a broker confirmation can match against it.
+        # ---------------------------------------------------------
+        if topic == "executions":
+            self.match_store.add_execution(message)
 
-        # Lock protects the shared trade_store because multiple consumers may write to it.
-        with self.trade_store_lock:
-            if trade_id not in self.trade_store:
-                self.trade_store[trade_id] = {
-                    "execution": None,
-                    "confirmation": None,
-                    "pnl": None,
-                    "status": "PENDING",
-                    "start_time": time.time()
-                }
+            print( f"Stored pending execution {trade_id}. Pending executions: {self.match_store.execution_count()}" )
+            # A confirmation may already be waiting.
+            self._try_match_pending_confirmations()
 
-                if self.in_memory_store_size_gauge:
-                    self.in_memory_store_size_gauge.inc()
+        # ---------------------------------------------------------
+        # Confirmation arrives
+        # Try to find either:
+        # 1. one execution
+        # 2. an aggregation of multiple executions
+        # ---------------------------------------------------------
+        
+        elif topic == "confirmations":
+            self.match_store.add_confirmation(message)
+            print( f"Stored pending confirmation {trade_id}." )
 
-            # Map each Kafka topic to the appropriate record type.
-            if topic == "executions":
-                self.trade_store[trade_id]["execution"] = message
-            elif topic == "confirmations":
-                self.trade_store[trade_id]["confirmation"] = message
-            elif topic == "pnl_snapshot":
-                self.trade_store[trade_id]["pnl"] = message
-            else:
-                print(f"Unknown topic: {topic} for trade_id {trade_id}")
-                return
+            self._try_match_confirmation(message)
 
-            self._attempt_reconciliation(trade_id)
-
-    def _attempt_reconciliation(self, trade_id: str):
-        """
-        Execution and confirmation are required for reconciliation.
-        P&L is optional because it may arrive later.
-        """
-        trade_data = self.trade_store.get(trade_id)
-
-        if not trade_data:
-            print(f"Trade {trade_id} not found in store for reconciliation")
-            return
-
-        execution = trade_data.get("execution")
-        confirmation = trade_data.get("confirmation")
-        pnl = trade_data.get("pnl")
-
-        if execution and confirmation:
-            self._perform_reconciliation_and_save(
-                trade_id,
-                execution,
-                confirmation,
-                pnl
-            )
+        # ---------------------------------------------------------
+        # P&L arrives
+        # Keep it pending for later association.
+        # ---------------------------------------------------------
+        elif topic == "pnl_snapshot":
+            self.match_store.add_pnl(message)
+            print( f"Stored pending P&L {trade_id}. Pending P&L records: {self.match_store.pnl_count()}" )
         else:
-            print(f"Trade {trade_id} not ready. Missing execution or confirmation.")
-
+            print( f"Unknown topic: {topic} for trade_id {trade_id}" )
+            
     def _perform_reconciliation_and_save(
         self,
         trade_id: str,
-        execution: dict,
-        confirmation: dict,
-        pnl: dict = None
+        execution,
+        confirmation,
+        pnl=None
     ):
         """
-        Compare economically important fields between internal execution,
-        broker confirmation, and optional P&L records.
+        Compare canonical economic fields.
+
+        Source-specific differences such as 7203 vs 7203.T
+        should already have been resolved by normalization.
         """
         mismatches = []
         is_matched = True
@@ -161,11 +193,36 @@ class ReconciliationEngine:
             self.total_trades_counter.inc()
 
         # ---------------------------------------------------------
-        # Quantity reconciliation
-        # Quantity is expected to match exactly.
+        # Instrument identity
+        # Both source records should now contain the same canonical
+        # instrument_id regardless of their original ticker format.
         # ---------------------------------------------------------
-        execution_qty = execution.get("quantity")
-        confirmation_qty = confirmation.get("quantity")
+        execution_instrument = self._get(execution, "instrument_id")
+        confirmation_instrument = self._get(confirmation, "instrument_id")
+
+        if not execution_instrument or not confirmation_instrument:
+            mismatches.append({
+                "field": "instrument_id",
+                "execution": execution_instrument,
+                "confirmation": confirmation_instrument,
+                "reason": "Canonical instrument identity missing"
+            })
+            is_matched = False
+
+        elif execution_instrument != confirmation_instrument:
+            mismatches.append({
+                "field": "instrument_id",
+                "execution": execution_instrument,
+                "confirmation": confirmation_instrument,
+                "reason": "Instrument mismatch"
+            })
+            is_matched = False
+
+        # ---------------------------------------------------------
+        # Quantity
+        # ---------------------------------------------------------
+        execution_qty = self._get(execution, "quantity")
+        confirmation_qty = self._get(confirmation, "quantity")
 
         if execution_qty is None or confirmation_qty is None:
             mismatches.append({
@@ -177,8 +234,8 @@ class ReconciliationEngine:
             is_matched = False
 
         elif not is_within_tolerance(
-            float(execution_qty),
-            float(confirmation_qty),
+            execution_qty,
+            confirmation_qty,
             tolerance=0.0
         ):
             mismatches.append({
@@ -190,11 +247,11 @@ class ReconciliationEngine:
             is_matched = False
 
         # ---------------------------------------------------------
-        # Price reconciliation
-        # A small tolerance allows minor rounding differences.
+        # Price
+        # Small differences are allowed for rounding.
         # ---------------------------------------------------------
-        execution_price = execution.get("price")
-        confirmation_price = confirmation.get("price")
+        execution_price = self._get(execution, "price")
+        confirmation_price = self._get(confirmation, "price")
 
         if execution_price is None or confirmation_price is None:
             mismatches.append({
@@ -206,8 +263,8 @@ class ReconciliationEngine:
             is_matched = False
 
         elif not is_within_tolerance(
-            float(execution_price),
-            float(confirmation_price),
+            execution_price,
+            confirmation_price,
             tolerance=0.005
         ):
             mismatches.append({
@@ -219,96 +276,67 @@ class ReconciliationEngine:
             is_matched = False
 
         # ---------------------------------------------------------
-        # Timestamp reconciliation
-        # New data uses "timestamp", but fallback fields support
-        # older Kafka messages still present in the topic.
+        # Side
+        # BUY must reconcile against BUY and SELL against SELL.
         # ---------------------------------------------------------
-        exec_timestamp = (
-            execution.get("timestamp")
-            or execution.get("execution_timestamp")
-        )
+        execution_side = self._get(execution, "side")
+        confirmation_side = self._get(confirmation, "side")
 
-        conf_timestamp = (
-            confirmation.get("timestamp")
-            or confirmation.get("execution_timestamp")
-            or confirmation.get("broker_timestamp")
-        )
+        if (
+            execution_side
+            and confirmation_side
+            and execution_side != confirmation_side
+        ):
+            mismatches.append({
+                "field": "side",
+                "execution": execution_side,
+                "confirmation": confirmation_side,
+                "reason": "Trade side mismatch"
+            })
+            is_matched = False
 
-        if exec_timestamp is None or conf_timestamp is None:
+        # ---------------------------------------------------------
+        # Timestamp
+        # Timestamp aliases have already been handled by normalization.
+        # Reconciliation only compares canonical datetime values.
+        # ---------------------------------------------------------
+        execution_timestamp = self._get(execution, "timestamp")
+        confirmation_timestamp = self._get(confirmation, "timestamp")
+
+        if execution_timestamp is None or confirmation_timestamp is None:
             mismatches.append({
                 "field": "timestamp",
-                "execution": exec_timestamp,
-                "confirmation": conf_timestamp,
+                "execution": str(execution_timestamp),
+                "confirmation": str(confirmation_timestamp),
                 "reason": "Timestamp missing"
             })
             is_matched = False
 
-        else:
-            try:
-                exec_ts = parse_timestamp(exec_timestamp)
-                conf_ts = parse_timestamp(conf_timestamp)
-
-                # Allow small timing differences between internal and broker systems.
-                if not is_timestamp_within_drift(
-                    exec_ts,
-                    conf_ts,
-                    drift_ms=100
-                ):
-                    mismatches.append({
-                        "field": "timestamp",
-                        "execution": exec_timestamp,
-                        "confirmation": conf_timestamp,
-                        "reason": "Timestamp drift beyond 100ms"
-                    })
-                    is_matched = False
-
-            except (ValueError, TypeError) as e:
-                mismatches.append({
-                    "field": "timestamp",
-                    "execution": exec_timestamp,
-                    "confirmation": conf_timestamp,
-                    "reason": f"Timestamp parsing error: {e}"
-                })
-                is_matched = False
+        elif not is_timestamp_within_drift(
+            execution_timestamp,
+            confirmation_timestamp,
+            drift_ms=100
+        ):
+            mismatches.append({
+                "field": "timestamp",
+                "execution": execution_timestamp.isoformat()
+                
+                if isinstance(execution_timestamp, datetime)
+                else str(execution_timestamp),
+                "confirmation": confirmation_timestamp.isoformat()
+                
+                if isinstance(confirmation_timestamp, datetime)
+                else str(confirmation_timestamp),
+                "reason": "Timestamp drift beyond 100ms"
+            })
+            is_matched = False
 
         # ---------------------------------------------------------
-        # Instrument reconciliation
-        # ISIN is preferred because broker and internal ticker
-        # representations may differ, e.g. 7203 vs 7203.T.
+        # Currency
+        # Raw "trade_currency" has already been normalized to "currency".
         # ---------------------------------------------------------
-        execution_isin = execution.get("isin")
-        confirmation_isin = confirmation.get("isin")
-
-        if execution_isin and confirmation_isin:
-            if execution_isin != confirmation_isin:
-                mismatches.append({
-                    "field": "isin",
-                    "execution": execution_isin,
-                    "confirmation": confirmation_isin,
-                    "reason": "Instrument mismatch"
-                })
-                is_matched = False
-
-        else:
-            execution_ticker = execution.get("ticker")
-            confirmation_ticker = confirmation.get("ticker")
-
-            if execution_ticker != confirmation_ticker:
-                mismatches.append({
-                    "field": "ticker",
-                    "execution": execution_ticker,
-                    "confirmation": confirmation_ticker,
-                    "reason": "Ticker mismatch"
-                })
-                is_matched = False
-
-        # ---------------------------------------------------------
-        # Currency reconciliation
-        # A trade should normally have the same transaction currency
-        # across the internal execution and broker confirmation.
-        # ---------------------------------------------------------
-        execution_currency = execution.get("trade_currency")
-        confirmation_currency = confirmation.get("trade_currency")
+        execution_currency = self._get(execution, "currency")
+        confirmation_currency = self._get(confirmation, "currency")
 
         if (
             execution_currency
@@ -316,7 +344,7 @@ class ReconciliationEngine:
             and execution_currency != confirmation_currency
         ):
             mismatches.append({
-                "field": "trade_currency",
+                "field": "currency",
                 "execution": execution_currency,
                 "confirmation": confirmation_currency,
                 "reason": "Trade currency mismatch"
@@ -324,17 +352,12 @@ class ReconciliationEngine:
             is_matched = False
 
         # ---------------------------------------------------------
-        # Settlement date reconciliation
-        # Ensures both systems expect the trade to settle on the same day.
+        # Settlement date
         # ---------------------------------------------------------
-        execution_settlement = execution.get("settlement_date")
-        confirmation_settlement = confirmation.get("settlement_date")
+        execution_settlement = self._get(execution, "settlement_date")
+        confirmation_settlement = self._get(confirmation, "settlement_date")
 
-        if (
-            execution_settlement
-            and confirmation_settlement
-            and execution_settlement != confirmation_settlement
-        ):
+        if ( execution_settlement and confirmation_settlement and execution_settlement != confirmation_settlement ):
             mismatches.append({
                 "field": "settlement_date",
                 "execution": execution_settlement,
@@ -344,19 +367,17 @@ class ReconciliationEngine:
             is_matched = False
 
         # ---------------------------------------------------------
-        # P&L consistency check
+        # P&L consistency
         #
-        # net_pnl should approximately equal:
-        # realized + unrealized + FX P&L - fees
-        #
-        # P&L may arrive later, so this check only runs when available.
+        # net_pnl =
+        # realized_pnl + unrealized_pnl + fx_pnl - total_fees
         # ---------------------------------------------------------
         if pnl:
-            net_pnl = pnl.get("net_pnl")
-            realized_pnl = pnl.get("realized_pnl", 0.0)
-            unrealized_pnl = pnl.get("unrealized_pnl", 0.0)
-            fx_pnl = pnl.get("fx_pnl", 0.0)
-            total_fees = pnl.get("total_fees", 0.0)
+            net_pnl = self._get(pnl, "net_pnl")
+            realized_pnl = self._get(pnl, "realized_pnl", 0.0)
+            unrealized_pnl = self._get(pnl, "unrealized_pnl", 0.0)
+            fx_pnl = self._get(pnl, "fx_pnl", 0.0)
+            total_fees = self._get(pnl, "total_fees", 0.0)
 
             if net_pnl is not None:
                 try:
@@ -366,7 +387,12 @@ class ReconciliationEngine:
                     fx = float(fx_pnl or 0.0)
                     fees = float(total_fees or 0.0)
 
-                    calculated_net_pnl = realized + unrealized + fx - fees
+                    calculated_net_pnl = (
+                        realized
+                        + unrealized
+                        + fx
+                        - fees
+                    )
 
                     if not is_within_tolerance(
                         calculated_net_pnl,
@@ -388,8 +414,8 @@ class ReconciliationEngine:
                     })
                     is_matched = False
 
-        # Final reconciliation status after all checks are completed.
         status = "MATCHED" if is_matched else "MISMATCHED"
+
         print(f"Reconciliation for Trade {trade_id}: Status = {status}")
 
         if mismatches:
@@ -402,19 +428,28 @@ class ReconciliationEngine:
             if self.matched_trades_counter:
                 self.matched_trades_counter.inc()
 
-        # Measure time from the first received message until reconciliation.
-        if (
-            "start_time" in self.trade_store[trade_id]
-            and self.reconciliation_latency_histogram
-        ):
-            latency = time.time() - self.trade_store[trade_id]["start_time"]
-            self.reconciliation_latency_histogram.observe(latency)
+        # Persist the reconciliation result.
+        self._save_result(
+            trade_id,
+            execution,
+            confirmation,
+            pnl,
+            status,
+            mismatches
+        )
 
-        # ---------------------------------------------------------
-        # Persist the latest reconciliation result to SQLite.
-        # Existing trade records are updated instead of duplicated.
-        # ---------------------------------------------------------
+    def _save_result( self, trade_id, execution, confirmation, pnl, status, mismatches ):
+        """
+        Store raw source records in SQLite while reconciliation operates
+        on normalized canonical objects.
+        """
         session = self.session
+
+        execution_data = self._serialize(execution)
+        confirmation_data = self._serialize(confirmation)
+        pnl_data = self._serialize(pnl)
+
+        ticker = self._get(execution, "ticker", "N/A")
 
         try:
             existing = (
@@ -424,11 +459,11 @@ class ReconciliationEngine:
             )
 
             if existing:
-                existing.ticker = execution.get("ticker", "N/A")
+                existing.ticker = ticker
                 existing.status = status
-                existing.execution_data = execution
-                existing.confirmation_data = confirmation
-                existing.pnl_data = pnl
+                existing.execution_data = execution_data
+                existing.confirmation_data = confirmation_data
+                existing.pnl_data = pnl_data
                 existing.mismatch_details = mismatches
                 existing.reconciliation_timestamp = datetime.utcnow()
 
@@ -437,11 +472,11 @@ class ReconciliationEngine:
             else:
                 new_result = ReconciliationResult(
                     trade_id=trade_id,
-                    ticker=execution.get("ticker", "N/A"),
+                    ticker=ticker,
                     status=status,
-                    execution_data=execution,
-                    confirmation_data=confirmation,
-                    pnl_data=pnl,
+                    execution_data=execution_data,
+                    confirmation_data=confirmation_data,
+                    pnl_data=pnl_data,
                     mismatch_details=mismatches
                 )
 
@@ -453,3 +488,129 @@ class ReconciliationEngine:
         except Exception as e:
             session.rollback()
             print(f"DB error for trade {trade_id}: {e}")
+            
+            
+    def _try_match_confirmation(self, confirmation):
+        """
+        Try to match a broker confirmation against pending executions.
+        """
+
+        executions = self.match_store.get_executions()
+
+        if not executions:
+            print(
+                f"No pending executions available for "
+                f"confirmation {self._get(confirmation, 'trade_id')}"
+            )
+            return
+
+        result = find_match(
+            executions,
+            confirmation,
+            threshold=80,
+            max_group_size=3
+        )
+
+        match_type = result["match_type"]
+
+        if match_type == "UNMATCHED":
+            print(
+                f"No economic match found for confirmation "
+                f"{self._get(confirmation, 'trade_id')}"
+            )
+            return
+
+        matched_executions = result["executions"]
+
+        if match_type == "ONE_TO_ONE":
+            execution_for_reconciliation = (
+                matched_executions[0]
+            )
+
+        elif match_type == "MANY_TO_ONE":
+            execution_for_reconciliation = (
+                result["aggregated_execution"]
+            )
+
+        else:
+            return
+
+        print(
+            f"Trade match found: "
+            f"type={match_type}, "
+            f"score={result['score']}"
+        )
+
+        # Remove records from pending store once matched.
+        self.match_store.remove_executions(
+            matched_executions
+        )
+
+        self.match_store.remove_confirmation(
+            confirmation
+        )
+
+        # Try to attach P&L if one exists.
+        pnl = self._find_pnl_for_match(
+            execution_for_reconciliation
+        )
+
+        # Reuse the reconciliation logic you already built.
+        reconciliation_id = (
+            self._get(confirmation, "trade_id")
+            or self._get(
+                execution_for_reconciliation,
+                "trade_id"
+            )
+        )
+
+        self._perform_reconciliation_and_save(
+            reconciliation_id,
+            execution_for_reconciliation,
+            confirmation,
+            pnl
+        )
+        
+
+    def _try_match_pending_confirmations(self):
+        """
+        Re-run matching when a new execution arrives.
+
+        This handles the case where the broker confirmation
+        arrived before the internal execution.
+        """
+
+        confirmations = (
+            self.match_store.get_confirmations()
+        )
+
+        for confirmation in confirmations:
+            self._try_match_confirmation(
+                confirmation
+            )
+            
+            
+    def _find_pnl_for_match(self, execution):
+        """
+        Initial P&L association logic.
+
+        Prefer same trade_id. More advanced economic
+        association will be added later.
+        """
+
+        execution_trade_id = self._get(
+            execution,
+            "trade_id"
+        )
+
+        for pnl in self.match_store.get_pnl_records():
+            pnl_trade_id = self._get(
+                pnl,
+                "trade_id"
+            )
+
+            if pnl_trade_id == execution_trade_id:
+                self.match_store.remove_pnl(pnl)
+                return pnl
+
+        return None
