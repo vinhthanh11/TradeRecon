@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 def generate_trade_data(
-    output_dir="data",
+    output_dir="berlin",
     num_trades=20,
     seed=42
 ):
@@ -527,21 +527,13 @@ def generate_trade_data(
         f"Generated {num_trades} trades."
     )
 
-    print(
-        f"Executions: {executions_file}"
-    )
-
-    print(
-        f"Broker confirmations: {broker_file}"
-    )
-
-    print(
-        f"P&L snapshots: {pnl_file}"
-    )
+    print(f"Executions: {executions_file}")
+    print(f"Broker confirmations: {broker_file}")
+    print(f"P&L snapshots: {pnl_file}")
 
 
 if __name__ == "__main__":
     generate_trade_data(
-        output_dir="data",
+        output_dir="berlin",
         num_trades=50
     )
