@@ -7,9 +7,6 @@ from kafka.errors import NoBrokersAvailable
 
 from .reconcile import ReconciliationEngine
 
-RETRY_TIME=2  # seconds
-
-
 # FIX (Amsterdam release)
 # Previously, the consumer attempted to connect to Kafka only once.
 # If the Kafka broker was still starting, KafkaConsumer raised
@@ -55,8 +52,8 @@ class TradeDataConsumer(threading.Thread):
                 # Docker may have started the Kafka container, but Kafka
                 # itself may still be initializing and not accepting connections.
                 # Wait and retry rather than allowing this thread to die.
-                print(f"Kafka unavailable for '{self.topic}'. Retrying in {RETRY_TIME} seconds...")
-                time.sleep(RETRY_TIME)
+                print(f"Kafka unavailable for '{self.topic}'. Retrying in 2 seconds...")
+                time.sleep(2)
 
             except Exception as e:
                 print(f"Error in consumer for topic {self.topic}: {e}")

@@ -50,7 +50,7 @@ def download_csv():
     TEST_HTTP_REQUESTS_TOTAL.inc() # Also increment for CSV downloads
     csv_filename = 'reconciliation_report.csv'
     report_generator.generate_csv_report(filename=csv_filename)
-    csv_filepath = os.path.join(report_generator.report_output_dir, csv_filename)
+    csv_filepath = os.path.abspath(os.path.join(report_generator.report_output_dir, csv_filename))
     return send_file(csv_filepath, as_attachment=True, download_name='TradeRecon_Report.csv', mimetype='text/csv')
 
 def start_consumers():
