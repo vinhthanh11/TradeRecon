@@ -1,10 +1,9 @@
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
-
-
+    
 @dataclass
-class CanonicalTrade:
+class CanonicalPnl:
     """
     Standard internal representation of a trade inside TradeRecon.
 
@@ -12,24 +11,7 @@ class CanonicalTrade:
     ticker formats, or source-specific identifiers. The normalization
     layer converts them into this common structure before reconciliation.
     """
-
-    trade_id: Optional[str]
-    instrument_id: Optional[str]
-    ticker: Optional[str]
-    side: Optional[str]
-    quantity: Optional[float]
-    price: Optional[float]
-    currency: Optional[str]
-    timestamp: Optional[datetime]
-    settlement_date: Optional[str]
-    account_id: Optional[str]
-    source: Optional[str]
-
-    # Keep the original message for debugging and audit purposes.
-    raw_data: Optional[dict] = None
     
-@dataclass
-class CanonicalPnl:
     trade_id: Optional[str]
     instrument_id: Optional[str]
     ticker: Optional[str]
