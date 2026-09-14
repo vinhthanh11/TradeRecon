@@ -870,6 +870,7 @@ class ReconciliationEngine:
             confirmation=confirmation,
             pnl=None,
             status="MISMATCHED",
+            break_type=break_type,
             mismatches=mismatches
         )
 
@@ -924,3 +925,39 @@ class ReconciliationEngine:
             return "MULTIPLE_BREAKS"
 
         return next(iter(break_types))
+    
+    
+    def get_pending_records(self):
+        """
+        Return the current live matching queue for the UI.
+        """
+
+        pending = []
+
+        for execution in self.match_store.get_executions():
+            pending.append({
+                "record_type": "EXECUTION",
+                "trade_id": self._get(execution, "trade_id"),
+                "ticker": self._get(execution, "ticker"),
+                "side": self._get(execution, "side"),
+                "quantity": self._get(execution, "quantity"),
+                "price": self._get(execution, "price"),
+                "account_id": self._get(execution, "account_id"),
+                "status": "PENDING",
+                "waiting_for": "CONFIRMATION"
+            })
+
+        for confirmation in self.match_store.get_confirmations():
+            pending.append({
+                "record_type": "CONFIRMATION",
+                "trade_id": self._get(confirmation, "trade_id"),
+                "ticker": self._get(confirmation, "ticker"),
+                "side": self._get(confirmation, "side"),
+                "quantity": self._get(confirmation, "quantity"),
+                "price": self._get(confirmation, "price"),
+                "account_id": self._get(confirmation, "account_id"),
+                "status": "PENDING",
+                "waiting_for": "EXECUTION"
+            })
+
+        return pending

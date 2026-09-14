@@ -71,6 +71,13 @@ def get_reconciliation_status():
     df = report_generator.fetch_all_reconciliation_results()
     return jsonify(df.to_dict(orient='records'))
 
+@app.route('/api/pending_matches')
+def get_pending_matches():
+    TEST_HTTP_REQUESTS_TOTAL.inc()
+    pending = ( reconciliation_engine .get_pending_records() )
+    return jsonify({ "count": len(pending), "records": pending })
+
+
 @app.route('/download/csv')
 def download_csv():
     TEST_HTTP_REQUESTS_TOTAL.inc() # Also increment for CSV downloads

@@ -40,6 +40,7 @@
         .table-container {
             overflow-x: auto;
             margin-top: 1.5rem;
+            margin-bottom: 2.5rem;
             border-radius: 0.5rem;
             border: 1px solid #e2e8f0;
         }
@@ -81,6 +82,11 @@
         .status-mismatched {
             color: #ef4444;
             /* Red */
+            font-weight: 600;
+        }
+
+        .status-pending {
+            color: #d97706;
             font-weight: 600;
         }
 
@@ -140,9 +146,38 @@
                 <p class="text-lg">Mismatched Trades</p>
                 <p class="text-3xl mt-2">{{ mismatched_count }}</p>
             </div>
+            <div class="summary-card bg-yellow-100 text-yellow-800">
+                <p class="text-lg">Pending Matches</p>
+                <p class="text-3xl mt-2" id="pending-count">0</p>
+            </div>
         </div>
 
-        <h2 class="text-2xl mb-4">Mismatched Trades ({{ mismatched_count }})</h2>
+        <h2 class="text-2xl mt-8 mb-4">Pending Matches (<span id="pending-heading-count">0</span>)
+        </h2>
+
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Trade ID</th>
+                        <th>Type</th>
+                        <th>Ticker</th>
+                        <th>Side</th>
+                        <th>Quantity</th>
+                        <th>Price</th>
+                        <th>Account</th>
+                        <th>Waiting For</th>
+                    </tr>
+                </thead>
+
+                <tbody id="pending-body">
+                    <tr id="pending-empty-row">
+                        <td class="text-gray-600"> No trades currently waiting for a match.</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        <h2 class="text-2xl mt-12 mb-4">Mismatched Trades ({{ mismatched_count }})</h2>
         {% if mismatched_trades %}
         <div class="table-container">
             <table>
@@ -232,6 +267,88 @@
 
         <p class="text-sm text-gray-500 mt-8 text-center">TradeRecon - A real-time trade reconciliation engine.</p>
     </div>
+
+
+    <script>
+    async function loadPendingMatches() {
+        try {
+            const response = await fetch('/api/pending_matches');
+
+            if (!response.ok) {
+                throw new Error(
+                    `HTTP ${response.status}`
+                );
+            }
+
+            const data = await response.json();
+
+            const count = data.count ?? 0;
+
+            document.getElementById(
+                'pending-count'
+            ).textContent = count;
+
+            document.getElementById(
+                'pending-heading-count'
+            ).textContent = count;
+
+            const body = document.getElementById(
+                'pending-body'
+            );
+
+            body.innerHTML = '';
+
+            if (!data.records || data.records.length === 0) {
+                body.innerHTML = `
+                    <tr>
+                        <td colspan="8" class="text-gray-600">
+                            No trades currently waiting for a match.
+                        </td>
+                    </tr>
+                `;
+
+                return;
+            }
+
+            for (const record of data.records) {
+                const row = document.createElement(
+                    'tr'
+                );
+
+                row.className = 'status-pending';
+
+                row.innerHTML = `
+                    <td>${record.trade_id ?? 'N/A'}</td>
+                    <td>${record.record_type ?? 'N/A'}</td>
+                    <td>${record.ticker ?? 'N/A'}</td>
+                    <td>${record.side ?? 'N/A'}</td>
+                    <td>${record.quantity ?? 'N/A'}</td>
+                    <td>${record.price ?? 'N/A'}</td>
+                    <td>${record.account_id ?? 'N/A'}</td>
+                    <td>${record.waiting_for ?? 'N/A'}</td>
+                `;
+
+                body.appendChild(row);
+            }
+
+        } catch (error) {
+            console.error(
+                'Failed to load pending matches:',
+                error
+            );
+        }
+    }
+
+    loadPendingMatches();
+
+    setInterval(
+        loadPendingMatches,
+        2000
+    );
+    </script>
+
+
+
 </body>
 
 </html>
