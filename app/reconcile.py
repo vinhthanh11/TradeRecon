@@ -3,13 +3,14 @@ import time
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from sqlalchemy import create_engine, Column, String, DateTime, Integer
+from sqlalchemy import event
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.dialects.sqlite import JSON as SQLiteJSON
 from .utils import is_within_tolerance, is_timestamp_within_drift
 from .matching.match_store import MatchStore
 from .matching.group_matcher import find_match
-
+import threading
 
 Base = declarative_base()
 
@@ -53,16 +54,31 @@ class ReconciliationEngine:
         self.reconciliation_aliases = {}
         
 
-        self.engine = create_engine(db_url)
-        Base.metadata.create_all(self.engine)
+        # Starting Database engine and session
+        # BEFORE: BEFORE ReconciliationEngine -> self.session -> shared by every thread
+        # NOW: execution thread -> self.Session() -> confirmation thread -> self.Session() -> P&L thread 
+        # -> self.Session() ->stale sweeper ->  self.Session()
+        self.engine = create_engine( db_url, 
+                                    connect_args={ "check_same_thread": False }, pool_pre_ping=True, )
+        
+        # WAL setup
+        if self.engine.url.drivername.startswith("sqlite"):
+            @event.listens_for( self.engine, "connect" )
+            def set_sqlite_pragma( dbapi_connection, connection_record ):
+                cursor = dbapi_connection.cursor()
 
-        if db_session:
-            self.session = db_session
-        else:
-            Session = sessionmaker(bind=self.engine)
-            self.session = Session()
+                cursor.execute( "PRAGMA journal_mode=WAL" )
+                cursor.execute( "PRAGMA busy_timeout=5000" )
 
-        self.db_session = self.session
+                cursor.close()
+        
+        Base.metadata.create_all( self.engine )
+
+        self.Session = sessionmaker( bind=self.engine )
+
+        self.db_session = db_session
+        self.db_lock = threading.Lock()
+
         print(f"ReconciliationEngine initialized with DB: {db_url}")
 
         self.total_trades_counter = None
@@ -449,56 +465,79 @@ class ReconciliationEngine:
         Store raw source records in SQLite while reconciliation operates
         on normalized canonical objects.
         """
-        session = self.session
+
+        # Create a fresh SQLAlchemy session for this DB operation.
+        session = (
+            self.db_session
+            if self.db_session is not None
+            else self.Session()
+        )
 
         execution_data = self._serialize(execution)
         confirmation_data = self._serialize(confirmation)
         pnl_data = self._serialize(pnl)
 
-        ticker = ( self._get( execution, "ticker" ) 
-                or self._get( confirmation, "ticker" ) 
-                or "N/A" )
+        ticker = (
+            self._get(execution, "ticker")
+            or self._get(confirmation, "ticker")
+            or "N/A"
+        )
 
         try:
-            existing = (
-                session.query(ReconciliationResult)
-                .filter_by(trade_id=trade_id)
-                .first()
-            )
+            with self.db_lock:
 
-            if existing:
-                existing.ticker = ticker
-                existing.status = status
-                existing.execution_data = execution_data
-                existing.confirmation_data = confirmation_data
-                existing.pnl_data = pnl_data
-                existing.break_type = break_type
-                existing.mismatch_details = mismatches
-                existing.reconciliation_timestamp = datetime.utcnow()
-
-                print(f"Updated trade {trade_id} in DB.")
-
-            else:
-                new_result = ReconciliationResult(
-                    trade_id=trade_id,
-                    ticker=ticker,
-                    status=status,
-                    execution_data=execution_data,
-                    confirmation_data=confirmation_data,
-                    pnl_data=pnl_data,
-                    break_type=break_type,
-                    mismatch_details=mismatches
+                existing = (
+                    session.query(ReconciliationResult)
+                    .filter_by(trade_id=trade_id)
+                    .first()
                 )
 
-                session.add(new_result)
-                print(f"Inserted trade {trade_id} into DB.")
+                if existing:
+                    existing.ticker = ticker
+                    existing.status = status
+                    existing.execution_data = execution_data
+                    existing.confirmation_data = confirmation_data
+                    existing.pnl_data = pnl_data
+                    existing.break_type = break_type
+                    existing.mismatch_details = mismatches
+                    existing.reconciliation_timestamp = datetime.utcnow()
 
-            session.commit()
+                    print(
+                        f"Updated trade {trade_id} in DB."
+                    )
+
+                else:
+                    new_result = ReconciliationResult(
+                        trade_id=trade_id,
+                        ticker=ticker,
+                        status=status,
+                        execution_data=execution_data,
+                        confirmation_data=confirmation_data,
+                        pnl_data=pnl_data,
+                        break_type=break_type,
+                        mismatch_details=mismatches
+                    )
+
+                    session.add(new_result)
+
+                    print(
+                        f"Inserted trade {trade_id} into DB."
+                    )
+
+                session.commit()
 
         except Exception as e:
             session.rollback()
-            print(f"DB error for trade {trade_id}: {e}")
-            
+
+            print(
+                f"DB error for trade {trade_id}: {e}"
+            )
+
+        finally:
+            # Only close sessions created by this method.
+            # If a test injected db_session, leave it open.
+            if self.db_session is None:
+                session.close()            
             
     def _try_match_confirmation(self, confirmation):
         """
@@ -584,13 +623,14 @@ class ReconciliationEngine:
             confirmation
         )
 
+        # Reconcile only once.
         self._perform_reconciliation_and_save(
             reconciliation_id,
             execution_for_reconciliation,
             confirmation,
             pnl
         )
-                
+                        
 
     def _try_match_pending_confirmations(self):
         """

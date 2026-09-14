@@ -33,7 +33,6 @@ def find_direct_match(executions, confirmation, threshold=80):
 
     return None
 
-
 def find_aggregated_match(
     executions,
     confirmation,
@@ -41,22 +40,17 @@ def find_aggregated_match(
     max_group_size=3
 ):
     """
-    Try combinations of multiple executions against one confirmation.
-
-    Example:
-        Execution 1: BUY 100 @ 190.10
-        Execution 2: BUY 100 @ 190.30
-
-        Broker:
-        BUY 200 @ 190.20
-
-    The two executions are aggregated before matching.
+    Find the strongest multiple-execution representation
+    for a single broker confirmation.
     """
 
     max_group_size = min(
         max_group_size,
         len(executions)
     )
+
+    best_match = None
+    best_score = 0
 
     for group_size in range(
         2,
@@ -72,7 +66,6 @@ def find_aggregated_match(
                 )
 
             except ValueError:
-                # These executions cannot logically be grouped together.
                 continue
 
             score = calculate_match_score(
@@ -80,17 +73,26 @@ def find_aggregated_match(
                 confirmation
             )
 
-            if score >= threshold:
-                return {
+            if (
+                score >= threshold
+                and score > best_score
+            ):
+                best_score = score
+
+                best_match = {
                     "match_type": "MANY_TO_ONE",
-                    "executions": list(execution_group),
-                    "aggregated_execution": aggregated,
-                    "confirmation": confirmation,
-                    "score": score
+                    "executions": list(
+                        execution_group
+                    ),
+                    "aggregated_execution":
+                        aggregated,
+                    "confirmation":
+                        confirmation,
+                    "score":
+                        score
                 }
 
-    return None
-
+    return best_match
 
 def find_match(
     executions,
@@ -99,11 +101,15 @@ def find_match(
     max_group_size=3
 ):
     """
-    Find the best available representation match.
+    Find the best available economic representation.
 
-    Order:
-    1. Try direct one-to-one matching.
-    2. If no direct match exists, try many-to-one aggregation.
+    Both direct and aggregated matches are evaluated.
+
+    The candidate with the highest score wins.
+
+    This prevents a partial execution from being incorrectly
+    accepted as ONE_TO_ONE when multiple executions together
+    provide a stronger MANY_TO_ONE match.
     """
 
     direct_match = find_direct_match(
@@ -112,9 +118,6 @@ def find_match(
         threshold
     )
 
-    if direct_match:
-        return direct_match
-
     aggregated_match = find_aggregated_match(
         executions,
         confirmation,
@@ -122,12 +125,26 @@ def find_match(
         max_group_size
     )
 
-    if aggregated_match:
+    # Neither worked.
+    if not direct_match and not aggregated_match:
+        return {
+            "match_type": "UNMATCHED",
+            "executions": [],
+            "confirmation": confirmation,
+            "score": 0
+        }
+
+    # Only direct worked.
+    if direct_match and not aggregated_match:
+        return direct_match
+
+    # Only aggregation worked.
+    if aggregated_match and not direct_match:
         return aggregated_match
 
-    return {
-        "match_type": "UNMATCHED",
-        "executions": [],
-        "confirmation": confirmation,
-        "score": 0
-    }
+    # Both are technically eligible.
+    # Choose whichever explains the broker record better.
+    if aggregated_match["score"] > direct_match["score"]:
+        return aggregated_match
+
+    return direct_match

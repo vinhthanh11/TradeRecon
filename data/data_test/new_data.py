@@ -5,14 +5,17 @@ from pathlib import Path
 
 
 SCENARIO_WEIGHTS = {
-    "MATCHED": 65,
-    "PRICE_BREAK": 8,
-    "QUANTITY_BREAK": 7,
-    "TIMESTAMP_BREAK": 6,
-    "SETTLEMENT_BREAK": 4,
-    "MISSING_CONFIRMATION": 4,
+    "MATCHED": 50,
+    "PRICE_BREAK": 7,
+    "QUANTITY_BREAK": 6,
+    "TIMESTAMP_BREAK": 5,
+    "SETTLEMENT_BREAK": 3,
+    "MISSING_CONFIRMATION": 3,
     "MISSING_EXECUTION": 3,
     "PNL_BREAK": 3,
+
+    "PARTIAL_CONFIRMATION": 10,
+    "MANY_TO_ONE": 10,
 }
 
 
@@ -22,6 +25,34 @@ def choose_scenario():
         weights=list(SCENARIO_WEIGHTS.values()),
         k=1
     )[0]
+
+def split_quantity(quantity):
+    """
+    Split a quantity into two realistic partial fills.
+    """
+
+    if quantity <= 1:
+        return quantity, 0
+
+    ratio = random.choice([
+        0.25,
+        0.50,
+        0.75,
+    ])
+
+    first_quantity = int(
+        quantity * ratio
+    )
+
+    second_quantity = (
+        quantity
+        - first_quantity
+    )
+
+    return (
+        first_quantity,
+        second_quantity
+    )
 
 
 def generate_trade_data(
@@ -526,6 +557,257 @@ def generate_trade_data(
             "pricing_source": "MARKET_DATA",
             "source_system": "PNL_ENGINE",
         }
+
+        # =====================================================
+        # GROUPED / PARTIAL MATCHING SCENARIOS
+        # =====================================================
+
+        if scenario == "PARTIAL_CONFIRMATION":
+
+            first_quantity, second_quantity = (
+                split_quantity(quantity)
+            )
+
+            # One full internal execution.
+            executions.append(
+                execution_record
+            )
+
+            # -------------------------------------------------
+            # Broker confirmation part 1
+            # -------------------------------------------------
+
+            confirmation_1 = (
+                confirmation_record.copy()
+            )
+
+            confirmation_1_notional = round(
+                first_quantity
+                * broker_price,
+                2
+            )
+
+            confirmation_1.update({
+                "broker_execution_id":
+                    f"{broker_execution_id}_A",
+
+                "quantity":
+                    first_quantity,
+
+                "gross_notional":
+                    confirmation_1_notional,
+
+                "timestamp":
+                    broker_timestamp.isoformat(
+                        timespec="milliseconds"
+                    ),
+            })
+
+            # -------------------------------------------------
+            # Broker confirmation part 2
+            # -------------------------------------------------
+
+            confirmation_2 = (
+                confirmation_record.copy()
+            )
+
+            second_timestamp = (
+                broker_timestamp
+                + timedelta(
+                    seconds=random.randint(
+                        2,
+                        8
+                    )
+                )
+            )
+
+            confirmation_2_notional = round(
+                second_quantity
+                * broker_price,
+                2
+            )
+
+            confirmation_2.update({
+                "broker_execution_id":
+                    f"{broker_execution_id}_B",
+
+                "quantity":
+                    second_quantity,
+
+                "gross_notional":
+                    confirmation_2_notional,
+
+                "timestamp":
+                    second_timestamp.isoformat(
+                        timespec="milliseconds"
+                    ),
+            })
+
+            confirmations.extend([
+                confirmation_1,
+                confirmation_2,
+            ])
+
+            pnl_snapshots.append(
+                pnl_record
+            )
+
+            expected_results.append({
+                "trade_id": trade_id,
+                "scenario":
+                    "PARTIAL_CONFIRMATION",
+                "expected_status":
+                    "MATCHED",
+                "expected_break_type":
+                    "",
+            })
+
+            # Prevent normal one-record logic
+            # from running for this scenario.
+            continue
+
+        if scenario == "MANY_TO_ONE":
+
+            first_quantity, second_quantity = (
+                split_quantity(quantity)
+            )
+
+            # -------------------------------------------------
+            # Internal execution part 1
+            # -------------------------------------------------
+
+            execution_1 = (
+                execution_record.copy()
+            )
+
+            execution_1_id = (
+                f"{trade_id}_A"
+            )
+
+            execution_1.update({
+                "trade_id":
+                    execution_1_id,
+
+                "execution_id":
+                    f"{execution_id}_A",
+
+                "quantity":
+                    first_quantity,
+
+                "notional":
+                    round(
+                        first_quantity
+                        * price,
+                        2
+                    ),
+            })
+
+            # -------------------------------------------------
+            # Internal execution part 2
+            # -------------------------------------------------
+
+            execution_2 = (
+                execution_record.copy()
+            )
+
+            execution_2_id = (
+                f"{trade_id}_B"
+            )
+
+            execution_2.update({
+                "trade_id":
+                    execution_2_id,
+
+                "execution_id":
+                    f"{execution_id}_B",
+
+                "quantity":
+                    second_quantity,
+
+                "notional":
+                    round(
+                        second_quantity
+                        * price,
+                        2
+                    ),
+            })
+
+            executions.extend([
+                execution_1,
+                execution_2,
+            ])
+
+            # -------------------------------------------------
+            # Broker sees one aggregated trade
+            # with a completely different trade ID.
+            # -------------------------------------------------
+
+            grouped_broker_id = (
+                f"BRK_{trade_id}"
+            )
+
+            grouped_confirmation = (
+                confirmation_record.copy()
+            )
+
+            grouped_confirmation.update({
+                "trade_id":
+                    grouped_broker_id,
+
+                "broker_trade_id":
+                    f"BT_GROUP_{i:06d}",
+
+                "broker_execution_id":
+                    f"BE_GROUP_{i:06d}",
+
+                "quantity":
+                    quantity,
+
+                "gross_notional":
+                    round(
+                        quantity
+                        * broker_price,
+                        2
+                    ),
+            })
+
+            confirmations.append(
+                grouped_confirmation
+            )
+
+            # P&L can remain associated
+            # with the economic internal group.
+            grouped_pnl = (
+                pnl_record.copy()
+            )
+
+            grouped_pnl.update({
+                "trade_id":
+                    execution_1_id
+            })
+
+            pnl_snapshots.append(
+                grouped_pnl
+            )
+
+            expected_results.append({
+                "trade_id":
+                    (
+                        f"{execution_1_id}"
+                        f"+{execution_2_id}"
+                    ),
+
+                "scenario":
+                    "MANY_TO_ONE",
+
+                "expected_status":
+                    "MATCHED",
+
+                "expected_break_type":
+                    "",
+            })
+
+            continue
 
         # =====================================================
         # DECIDE WHICH RECORDS ACTUALLY EXIST
