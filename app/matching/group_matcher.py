@@ -14,10 +14,7 @@ def find_direct_match(executions, confirmation, threshold=80):
     best_score = 0
 
     for execution in executions:
-        score = calculate_match_score(
-            execution,
-            confirmation
-        )
+        score = calculate_match_score( execution, confirmation )
 
         if score > best_score:
             best_score = score
@@ -33,73 +30,41 @@ def find_direct_match(executions, confirmation, threshold=80):
 
     return None
 
-def find_aggregated_match(
-    executions,
-    confirmation,
-    threshold=80,
-    max_group_size=3
-):
+def find_aggregated_match( executions, confirmation, threshold=80, max_group_size=3 ):
     """
     Find the strongest multiple-execution representation
     for a single broker confirmation.
     """
 
-    max_group_size = min(
-        max_group_size,
-        len(executions)
-    )
+    max_group_size = min( max_group_size, len(executions) )
 
     best_match = None
     best_score = 0
 
-    for group_size in range(
-        2,
-        max_group_size + 1
-    ):
-        for execution_group in combinations(
-            executions,
-            group_size
-        ):
+    for group_size in range( 2, max_group_size + 1 ):
+        for execution_group in combinations( executions, group_size ):
             try:
-                aggregated = aggregate_trades(
-                    list(execution_group)
-                )
+                aggregated = aggregate_trades( list(execution_group) )
 
             except ValueError:
                 continue
 
-            score = calculate_match_score(
-                aggregated,
-                confirmation
-            )
+            score = calculate_match_score( aggregated, confirmation )
 
-            if (
-                score >= threshold
-                and score > best_score
-            ):
+            if ( score >= threshold and score > best_score ):
                 best_score = score
 
                 best_match = {
                     "match_type": "MANY_TO_ONE",
-                    "executions": list(
-                        execution_group
-                    ),
-                    "aggregated_execution":
-                        aggregated,
-                    "confirmation":
-                        confirmation,
-                    "score":
-                        score
+                    "executions": list( execution_group ),
+                    "aggregated_execution": aggregated,
+                    "confirmation": confirmation,
+                    "score": score
                 }
 
     return best_match
 
-def find_match(
-    executions,
-    confirmation,
-    threshold=80,
-    max_group_size=3
-):
+def find_match( executions, confirmation, threshold=80, max_group_size=3 ):
     """
     Find the best available economic representation.
 
